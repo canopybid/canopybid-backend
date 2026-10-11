@@ -1,0 +1,739 @@
+{
+ "version": "2026-10-10-draft",
+ "market": "Nashville",
+ "note": "Only ZIPs NOT on hold. The 41 held ZIPs are in nashville_zips_on_hold.json and must not be imported until approved.",
+ "zips": [
+  {
+   "zip": "37010",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37011",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37013",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37014",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37015",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37022",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37024",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37027",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37029",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37031",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37032",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37035",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37036",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37037",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37046",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37048",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37049",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37051",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37055",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37056",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37060",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37062",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37063",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37064",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37065",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37066",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37067",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37068",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37069",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37070",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37071",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37072",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37073",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37075",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37076",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37077",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37080",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37082",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37085",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37086",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37087",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37088",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37089",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37090",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37115",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37116",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37118",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37119",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37121",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37122",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37127",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37128",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37129",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37130",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37131",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37132",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37133",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37135",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37136",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37138",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37141",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37143",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37146",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37148",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37152",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37153",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37165",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37167",
+   "territory": "Rutherford",
+   "territory_id": 5,
+   "status": "assigned"
+  },
+  {
+   "zip": "37172",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37174",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37179",
+   "territory": "Williamson Central",
+   "territory_id": 3,
+   "status": "assigned"
+  },
+  {
+   "zip": "37181",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37184",
+   "territory": "Wilson",
+   "territory_id": 6,
+   "status": "assigned"
+  },
+  {
+   "zip": "37186",
+   "territory": "Sumner",
+   "territory_id": 7,
+   "status": "assigned"
+  },
+  {
+   "zip": "37187",
+   "territory": "Dickson",
+   "territory_id": 9,
+   "status": "assigned"
+  },
+  {
+   "zip": "37188",
+   "territory": "Robertson/Cheatham",
+   "territory_id": 8,
+   "status": "assigned"
+  },
+  {
+   "zip": "37189",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37201",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37202",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37203",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37204",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37205",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37206",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37207",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37208",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37209",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37210",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37211",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37212",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37213",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37214",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37215",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37216",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37217",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37218",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37219",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37220",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37221",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37222",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37224",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37227",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37228",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37229",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37230",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37232",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37234",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37235",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37236",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37237",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37238",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37239",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37240",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37241",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37242",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37243",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37244",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37245",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37246",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37247",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37248",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37249",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  },
+  {
+   "zip": "37250",
+   "territory": "Nashville Core",
+   "territory_id": 1,
+   "status": "assigned"
+  }
+ ]
+}
