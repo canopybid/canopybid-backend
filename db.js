@@ -69,6 +69,25 @@ async function initDb() {
     );
   `);
 
+  // --- Nashville-focus additions (all idempotent; safe to run on every start) ---
+  // A territory is purchasable only when offered = 1 (its boundary has been confirmed by an admin).
+  await pool.query("ALTER TABLE territories ADD COLUMN IF NOT EXISTS offered INTEGER DEFAULT 0");
+  await pool.query("ALTER TABLE territories ADD COLUMN IF NOT EXISTS boundary_version TEXT");
+  // Customer-facing name. Routing never reads it; ids and ZIPs decide everything.
+  await pool.query("ALTER TABLE territories ADD COLUMN IF NOT EXISTS display_name TEXT");
+  await pool.query("ALTER TABLE territories ADD COLUMN IF NOT EXISTS retired INTEGER DEFAULT 0");   // merged into another territory: kept for history, never listed or sold
+  // ZIP -> territory assignments used for lead routing (one territory per ZIP).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS territory_zips (
+      zip TEXT PRIMARY KEY,
+      territory_id INTEGER NOT NULL REFERENCES territories(id),
+      status TEXT,
+      boundary_version TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_territory_zips_territory ON territory_zips(territory_id)");
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leads (
       id SERIAL PRIMARY KEY,
@@ -109,6 +128,44 @@ async function initDb() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  // --- payments hardening: reservations while a buyer is paying, Stripe webhook de-duplication, billing-driven suspension ---
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS checkout_reservations (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT,
+      buyer_email TEXT,
+      territory_id INTEGER NOT NULL REFERENCES territories(id),
+      status TEXT NOT NULL DEFAULT 'pending',
+      expires_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  // At most ONE live reservation per territory, enforced by the database itself (safe under concurrent checkouts).
+  await pool.query("ALTER TABLE checkout_reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT");
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS uq_reservation_pending ON checkout_reservations (territory_id) WHERE status = 'pending'");
+  await pool.query("CREATE TABLE IF NOT EXISTS stripe_events (id TEXT PRIMARY KEY, type TEXT, received_at TIMESTAMP DEFAULT NOW())");
+  await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS suspended_by_billing INTEGER DEFAULT 0");
+  await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT");
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS uq_company_checkout_session ON companies (stripe_checkout_session_id) WHERE stripe_checkout_session_id IS NOT NULL");
+  await pool.query("ALTER TABLE leads ADD COLUMN IF NOT EXISTS routing_basis TEXT");
+  // Company account state for lead eligibility: active | suspended | canceled. Set by an admin (no Stripe webhook yet).
+  await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS account_status TEXT DEFAULT 'active'");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_leads_territory_created ON leads(territory_id, created_at)");
+  // Routing outcome, recorded on every lead. territory_name/metro on a lead now mean the territory it was ROUTED to
+  // (null when unassigned); what the form guessed is kept only as an informational hint.
+  await pool.query("ALTER TABLE leads ADD COLUMN IF NOT EXISTS routing_status TEXT");
+  await pool.query("ALTER TABLE leads ADD COLUMN IF NOT EXISTS routing_reason TEXT");
+  await pool.query("ALTER TABLE leads ADD COLUMN IF NOT EXISTS assigned_company_id INTEGER REFERENCES companies(id)");
+  await pool.query("ALTER TABLE leads ADD COLUMN IF NOT EXISTS submitted_territory_hint TEXT");
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_leads_assigned_company ON leads(assigned_company_id)");
+  // One-time backfill for leads that existed before these columns (touches only rows still null).
+  await pool.query(`UPDATE leads SET assigned_company_id = t.company_id FROM territories t
+                     WHERE leads.territory_id = t.id AND leads.assigned_company_id IS NULL
+                       AND leads.status <> 'submitted' AND t.company_id IS NOT NULL`);
+  await pool.query(`UPDATE leads SET routing_status = CASE WHEN assigned_company_id IS NOT NULL THEN 'assigned' ELSE 'unassigned' END,
+                           routing_reason = CASE WHEN assigned_company_id IS NOT NULL THEN NULL ELSE 'legacy' END
+                     WHERE routing_status IS NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS lead_status_history (

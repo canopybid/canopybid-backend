@@ -30,11 +30,15 @@ async function logAudit({ actorType, actorId, action, targetType, targetId, deta
     console.error("[audit] Failed to log:", err);
   }
 }
+// Stripe webhook: needs the RAW request body to verify the signature, so it is mounted BEFORE the JSON parser.
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => stripeWebhook(req, res));
 app.use(express.json({ limit: "50mb" })); // photos come through as base64, so raise the default limit
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const CHECKOUT_HOLD_MINUTES = 35;   // a territory is held for one buyer while their Stripe checkout is open (Stripe sessions expire after 31 min)
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5500";
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -89,7 +93,7 @@ function companyLeadEmailHtml(l, company, matchedTerritory) {
     </div>`;
 }
 
-function homeownerConfirmationEmailHtml(l) {
+function homeownerConfirmationEmailHtml(l, matched) {
   const priceLine = l.quote_low ? `$${Number(l.quote_low).toLocaleString()} – $${Number(l.quote_high).toLocaleString()}` : "Pending on-site inspection";
   return `
     <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; color: #14261B;">
@@ -103,7 +107,7 @@ function homeownerConfirmationEmailHtml(l) {
           <tr><td style="padding:4px 0; color:#76856E;">Services</td><td style="padding:4px 0;">${(l.services || []).join(", ")}</td></tr>
           <tr><td style="padding:4px 0; color:#76856E;">Preliminary range</td><td style="padding:4px 0; font-weight:bold;">${priceLine}</td></tr>
         </table>
-        <p style="font-size:13px; margin-top:18px;">A local tree company covering your area has been notified and should reach out soon. This is a preliminary estimate, not a final price — the company will confirm details on-site.</p>
+        <p style="font-size:13px; margin-top:18px;">${matched ? "A local tree company covering your area has been notified and should reach out soon." : "Our team will review your request and follow up with next steps."} This is a preliminary estimate, not a final price — the company will confirm details on-site.</p>
       </div>
     </div>`;
 }
@@ -242,16 +246,63 @@ Other rules:
 app.get("/api/territories", async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT t.id, t.state, t.metro, t.name, t.factor, c.name AS company_name
+      SELECT t.id, t.state, t.metro, t.name, t.factor, t.offered, t.boundary_version, t.display_name, c.name AS company_name
       FROM territories t
       LEFT JOIN companies c ON c.id = t.company_id
+      WHERE COALESCE(t.retired, 0) = 0
       ORDER BY t.metro, t.name
     `);
-    const withPricing = rows.map(r => ({ ...r, monthly_price: territoryMonthlyPrice(r.factor) }));
+    const withPricing = rows.map(r => ({ ...r, offered: r.offered === 1, monthly_price: territoryMonthlyPrice(r.factor) }));
     res.json(withPricing);
   } catch (err) {
     console.error("[territories] Failed:", err);
     res.status(500).json({ error: "Could not load territories." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/territories/:id/performance?range=30d|90d|all
+// Public, aggregate-only activity for one territory (no homeowner details).
+// - qualified lead: owner_confirmed, consent recorded, not flagged duplicate; counted once per lead row
+//   (a lead keeps the territory it was routed to at submission time, so history is not rewritten
+//   if boundaries change later), filtered by the lead's created_at.
+// - estimated project value: sum of the preliminary ranges shown to homeowners. It is NOT revenue.
+// - jobs won / booked sales / collected revenue are not tracked yet and are reported as null.
+// ---------------------------------------------------------------------------
+const readLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false,
+  message: { error: "Too many requests. Please wait a few minutes and try again." } });
+
+app.get("/api/territories/:id/performance", readLimiter, async (req, res) => {
+  const id = Number(req.params.id);
+  const range = String(req.query.range || "30d");
+  const days = { "30d": 30, "90d": 90, all: null }[range];
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Invalid territory id." });
+  if (days === undefined) return res.status(400).json({ error: "range must be 30d, 90d or all." });
+  try {
+    const { rows: tr } = await pool.query("SELECT id, name, metro, offered FROM territories WHERE id = $1", [id]);
+    if (!tr[0]) return res.status(404).json({ error: "Territory not found." });
+    const { rows } = await pool.query(
+      `SELECT COUNT(*) AS n, COUNT(quote_low) AS priced,
+              COALESCE(SUM(quote_low), 0) AS lo, COALESCE(SUM(quote_high), 0) AS hi
+         FROM leads
+        WHERE territory_id = $1 AND owner_confirmed = 1 AND consent_timestamp IS NOT NULL
+          AND COALESCE(duplicate_flag, 0) = 0
+          AND ($2::int IS NULL OR created_at >= NOW() - ($2::int * INTERVAL '1 day'))`,
+      [id, days]
+    );
+    const r = rows[0], priced = Number(r.priced);
+    res.json({
+      territory_id: id, name: tr[0].name, range, offered: tr[0].offered === 1,
+      qualified_leads: Number(r.n),
+      priced_leads: priced,
+      estimated_value_low: priced ? Number(r.lo) : null,
+      estimated_value_high: priced ? Number(r.hi) : null,
+      jobs_won: null, booked_sales: null, collected_revenue: null,
+      updated_at: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error("[performance] Failed:", err);
+    res.status(500).json({ error: "Could not load territory activity." });
   }
 });
 
@@ -271,6 +322,15 @@ app.post("/api/checkout/create", publicLimiter, async (req, res) => {
 
   try {
     const { rows: territories } = await pool.query("SELECT * FROM territories WHERE id = ANY($1)", [territory_ids]);
+    // Server-side guard: draft (not yet offered) territories can never be purchased, whatever the browser sends.
+    const requested = [...new Set(territory_ids.map(Number))];
+    const notOffered = territories.filter(t => t.offered !== 1 || t.retired === 1);
+    if (territories.length !== requested.length || notOffered.length > 0) {
+      return res.status(400).json({
+        error: "One or more selected territories are not available for purchase yet.",
+        not_available: notOffered.map(t => t.name)
+      });
+    }
     const available = territories.filter(t => !t.company_id);
     const unavailable = territories.filter(t => t.company_id);
 
@@ -278,27 +338,63 @@ app.post("/api/checkout/create", publicLimiter, async (req, res) => {
       return res.status(400).json({ error: "All selected territories are already claimed.", unavailable: unavailable.map(t => t.name) });
     }
 
+    // Hold the territories for this buyer so nobody else can start paying for the same ones. The partial unique
+    // index on checkout_reservations makes this race-proof even when two buyers click at the same instant.
+    const holdId = "hold_" + crypto.randomBytes(8).toString("hex");
+    // A buyer who abandoned an earlier checkout and tries again must not be blocked by their own old hold: close it first.
+    const { rows: mine } = await pool.query("SELECT DISTINCT session_id FROM checkout_reservations WHERE status = 'pending' AND lower(buyer_email) = lower($1)", [email]);
+    for (const m of mine) {
+      if (m.session_id && m.session_id.startsWith("cs_")) { try { await stripe.checkout.sessions.expire(m.session_id); } catch (e) { /* already completed or expired */ } }
+      await pool.query("UPDATE checkout_reservations SET status = 'released' WHERE session_id = $1 AND status = 'pending'", [m.session_id]);
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE checkout_reservations SET status = 'expired' WHERE status = 'pending' AND expires_at < NOW()");
+      for (const t of available) {
+        await client.query(
+          "INSERT INTO checkout_reservations (session_id, buyer_email, territory_id, expires_at) VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)",
+          [holdId, email, t.id, String(CHECKOUT_HOLD_MINUTES)]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (e.code === "23505") {
+        return res.status(409).json({ error: "One of those territories is being purchased by someone else right now. Please try again in a few minutes.", reserved: true });
+      }
+      throw e;
+    } finally { client.release(); }
+
     const line_items = available.map(t => ({
       price_data: {
         currency: "usd",
         recurring: { interval: "month" },
         unit_amount: territoryMonthlyPrice(t.factor) * 100,
-        product_data: { name: `CanopyBid territory — ${t.metro}: ${t.name}` }
+        product_data: { name: `CanopyBid territory — ${t.metro}: ${t.display_name || t.name}` }
       },
       quantity: 1
     }));
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      line_items,
-      customer_email: email,
-      success_url: `${FRONTEND_URL}/canopybid-companies.html?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}/canopybid-companies.html?canceled=1`,
-      metadata: {
-        name, email, phone: phone || "",
-        territory_ids: JSON.stringify(available.map(t => t.id))
-      }
-    });
+    let session;
+    try {
+      session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        line_items,
+        customer_email: email,
+        expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
+        success_url: `${FRONTEND_URL}/canopybid-companies.html?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${FRONTEND_URL}/canopybid-companies.html?canceled=1`,
+        metadata: {
+          name, email, phone: phone || "",
+          territory_ids: JSON.stringify(available.map(t => t.id))
+        }
+      });
+    } catch (e) {
+      await pool.query("UPDATE checkout_reservations SET status = 'released' WHERE session_id = $1 AND status = 'pending'", [holdId]);
+      throw e;
+    }
+    await pool.query("UPDATE checkout_reservations SET session_id = $1 WHERE session_id = $2", [session.id, holdId]);
 
     res.json({ url: session.url, skipped_unavailable: unavailable.map(t => t.name) });
   } catch (err) {
@@ -324,51 +420,118 @@ app.get("/api/checkout/confirm", async (req, res) => {
       return res.status(402).json({ error: "Payment not completed for this session." });
     }
 
-    // If this session was already confirmed once, don't create a duplicate company.
-    const { rows: existingRows } = await pool.query("SELECT * FROM companies WHERE stripe_customer_id = $1", [session.customer]);
-    const existing = existingRows[0];
-    if (existing) {
-      const { rows: territories } = await pool.query("SELECT name, metro FROM territories WHERE company_id = $1", [existing.id]);
-      return res.json({ company_id: existing.id, api_key: existing.api_key, claimed_territories: territories });
-    }
-
-    const { name, email, phone, territory_ids } = session.metadata;
-    const ids = JSON.parse(territory_ids).map(Number);
-    const apiKey = crypto.randomBytes(24).toString("hex");
-
-    const insertResult = await pool.query(
-      "INSERT INTO companies (name, email, phone, api_key, stripe_customer_id, stripe_subscription_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-      [name, email, phone || null, apiKey, session.customer, session.subscription]
-    );
-    const companyId = insertResult.rows[0].id;
-
-    const claimed = [];
-    const failedToClaim = [];
-    for (const tId of ids) {
-      const result = await pool.query(
-        "UPDATE territories SET company_id = $1 WHERE id = $2 AND company_id IS NULL RETURNING id",
-        [companyId, tId]
-      );
-      if (result.rowCount > 0) claimed.push(tId);
-      else failedToClaim.push(tId);
-    }
-
-    const { rows: territories } = claimed.length
-      ? await pool.query("SELECT name, metro FROM territories WHERE id = ANY($1)", [claimed])
-      : { rows: [] };
-
-    if (failedToClaim.length > 0) {
-      const { rows: failedNames } = await pool.query("SELECT name, metro FROM territories WHERE id = ANY($1)", [failedToClaim]);
-      console.error(`[checkout/confirm] WARNING: company ${companyId} (${email}) paid for a territory that was already claimed by someone else: ${failedNames.map(t => t.name).join(", ")}. This needs a manual refund for that portion.`);
-      return res.json({ company_id: companyId, api_key: apiKey, claimed_territories: territories, failed_to_claim: failedNames });
-    }
-
-    res.json({ company_id: companyId, api_key: apiKey, claimed_territories: territories, failed_to_claim: [] });
+    const result = await fulfilSession(session);
+    res.json(result);
   } catch (err) {
     console.error("[checkout/confirm] Failed:", err);
     res.status(500).json({ error: "Could not confirm payment.", detail: String(err) });
   }
 });
+
+// Turns a PAID checkout session into a company + claimed territories. Safe to call any number of times and from two
+// places at once (the buyer's browser returning AND Stripe's webhook): a per-session advisory lock plus a unique
+// checkout-session column guarantee exactly one company per payment.
+async function fulfilSession(session) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [session.id]);
+    const { rows: existingRows } = await client.query("SELECT * FROM companies WHERE stripe_checkout_session_id = $1", [session.id]);
+    if (existingRows[0]) {
+      const existing = existingRows[0];
+      const { rows: territories } = await client.query("SELECT name, metro FROM territories WHERE company_id = $1", [existing.id]);
+      await client.query("COMMIT");
+      return { company_id: existing.id, api_key: existing.api_key, claimed_territories: territories, failed_to_claim: [] };
+    }
+    const { name, email, phone, territory_ids } = session.metadata || {};
+    const ids = JSON.parse(territory_ids || "[]").map(Number);
+    const apiKey = crypto.randomBytes(24).toString("hex");
+    const ins = await client.query(
+      "INSERT INTO companies (name, email, phone, api_key, stripe_customer_id, stripe_subscription_id, stripe_checkout_session_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+      [name, email, phone || null, apiKey, session.customer, session.subscription, session.id]
+    );
+    const companyId = ins.rows[0].id;
+    const claimed = [], failedToClaim = [];
+    for (const tId of ids) {
+      const r = await client.query("UPDATE territories SET company_id = $1 WHERE id = $2 AND company_id IS NULL AND offered = 1 RETURNING id", [companyId, tId]);
+      (r.rowCount > 0 ? claimed : failedToClaim).push(tId);
+    }
+    await client.query("UPDATE checkout_reservations SET status = 'completed' WHERE session_id = $1", [session.id]);
+    const { rows: territories } = claimed.length ? await client.query("SELECT name, metro FROM territories WHERE id = ANY($1)", [claimed]) : { rows: [] };
+    const { rows: failedNames } = failedToClaim.length ? await client.query("SELECT name, metro FROM territories WHERE id = ANY($1)", [failedToClaim]) : { rows: [] };
+    await client.query("COMMIT");
+    if (failedNames.length) console.error(`[fulfil] WARNING: company ${companyId} (${email}) paid for territory already claimed: ${failedNames.map(t => t.name).join(", ")}. Manual refund needed for that portion.`);
+    await logAudit({ actorType: "stripe", actorId: session.id, action: "checkout_fulfilled", targetType: "company", targetId: companyId, detail: { claimed, failedToClaim } });
+    return { company_id: companyId, api_key: apiKey, claimed_territories: territories, failed_to_claim: failedNames };
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally { client.release(); }
+}
+
+// POST /api/stripe/webhook: keeps our records in step with Stripe even when the buyer never returns to the site.
+async function stripeWebhook(req, res) {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(500).json({ error: "Webhook is not configured (STRIPE_WEBHOOK_SECRET missing)." });
+  let event;
+  try { event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET); }
+  catch (e) { return res.status(400).json({ error: "Invalid signature." }); }
+  try {
+    const seen = await pool.query("INSERT INTO stripe_events (id, type) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id", [event.id, event.type]);
+    if (!seen.rowCount) return res.json({ received: true, duplicate: true });
+    try {
+      const obj = event.data.object;
+      if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
+        if (obj.payment_status === "paid") await fulfilSession(obj);
+      } else if (event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
+        await pool.query("UPDATE checkout_reservations SET status = 'expired' WHERE session_id = $1 AND status = 'pending'", [obj.id]);
+      } else if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
+        const status = event.type === "customer.subscription.deleted" ? "canceled" : obj.status;
+        const { rows } = await pool.query("SELECT id, account_status, suspended_by_billing FROM companies WHERE stripe_subscription_id = $1", [obj.id]);
+        const c = rows[0];
+        if (c) {
+          let next = null, flag = c.suspended_by_billing;
+          if (status === "canceled") { next = "canceled"; flag = 0; }
+          else if (status === "past_due" || status === "unpaid") { if (c.account_status === "active") { next = "suspended"; flag = 1; } }
+          else if (status === "active" && c.suspended_by_billing === 1) { next = "active"; flag = 0; }
+          if (next) {
+            await pool.query("UPDATE companies SET account_status = $1, suspended_by_billing = $2 WHERE id = $3", [next, flag, c.id]);
+            await logAudit({ actorType: "stripe", actorId: event.id, action: "account_status_" + next, targetType: "company", targetId: c.id, detail: { subscription_status: status } });
+          }
+        }
+      }
+    } catch (e) {
+      await pool.query("DELETE FROM stripe_events WHERE id = $1", [event.id]);   // let Stripe retry this event
+      throw e;
+    }
+    res.json({ received: true });
+  } catch (e) {
+    console.error("[stripe webhook] Failed:", e);
+    res.status(500).json({ error: "Webhook handling failed." });
+  }
+}
+
+// Reads the ZIP used for routing. Only two sources count: the form's zip field and a ZIP that follows the state
+// in the address ("... TN 37027"). If both exist and disagree, or neither exists, the ZIP cannot be trusted.
+function resolveLeadZip(l) {
+  const norm = v => { const m = String(v == null ? "" : v).trim().match(/^(\d{5})(?:-\d{4})?$/); return m ? m[1] : null; };
+  const field = norm(l.zip);
+  const m = String(l.address || "").match(/\b(?:TN|Tennessee)\.?,?\s+(\d{5})(?:-\d{4})?\b/i);
+  const fromAddress = m ? m[1] : null;
+  if (field && fromAddress && field !== fromAddress) return { zip: null, reason: "zip_conflict" };
+  const zip = field || fromAddress;
+  return zip ? { zip } : { zip: null, reason: "zip_missing" };
+}
+
+// A company receives automatic leads only if its account is active, it is accepting leads, an admin has verified BOTH
+// its license and insurance, and neither has expired.
+function companyEligible(c) {
+  if (!c || c.accepting_leads === 0) return false;
+  if ((c.account_status || "active") !== "active") return false;
+  if (c.license_status !== "verified" || c.insurance_status !== "verified") return false;
+  const now = Date.now();
+  for (const d of [c.license_expiration, c.insurance_expiration]) if (d && new Date(d).getTime() < now) return false;
+  return true;
+}
 
 // ---------------------------------------------------------------------------
 // POST /api/leads
@@ -386,7 +549,6 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
   if (!l.name) missing.push("name");
   if (!l.phone) missing.push("phone");
   if (!l.address) missing.push("address");
-  if (!l.territory_name) missing.push("territory_name");
   if (!Array.isArray(l.trees) || l.trees.length === 0) missing.push("at least one tree submission");
   if (!l.owner_confirmed) missing.push("confirmation that they own or control the property");
   if (!l.consent_given) missing.push("consent to be contacted");
@@ -395,11 +557,30 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
   }
 
   try {
-    const { rows: terrRows } = await pool.query(
-      "SELECT * FROM territories WHERE name = $1 AND metro = $2 AND state = $3",
-      [l.territory_name, l.metro, l.state || "TN"]
-    );
-    const territory = terrRows[0];
+    // ROUTING (ZIP only). The city/territory name sent by the form is never used to pick a territory.
+    // A lead is routed automatically only when its ZIP belongs to a CONFIRMED (offered) territory that has an
+    // ELIGIBLE company. Everything else is stored as unassigned and goes to the admin manual-review queue.
+    const zr = resolveLeadZip(l);
+    let territory = null, routingBasis = "zip", routingStatus = "unassigned", routingReason = zr.reason || null, company = null;
+    if (zr.zip) {
+      const { rows } = await pool.query(
+        "SELECT t.* FROM territory_zips z JOIN territories t ON t.id = z.territory_id WHERE z.zip = $1", [zr.zip]);
+      const t = rows[0];
+      if (!t) routingReason = "zip_unassigned";
+      else if (t.offered !== 1) routingReason = "territory_draft";
+      else {
+        territory = t;
+        if (!t.company_id) routingReason = "no_company";
+        else {
+          const { rows: cr } = await pool.query("SELECT * FROM companies WHERE id = $1", [t.company_id]);
+          company = cr[0] || null;
+          if (!companyEligible(company)) { routingReason = "company_ineligible"; company = null; }
+          else { routingStatus = "assigned"; routingReason = null; }
+        }
+      }
+    } else routingBasis = "none";
+    const routedName = territory ? territory.name : null;
+    const routedMetro = territory ? territory.metro : null;
 
     // Duplicate/fraud flagging: same phone or same address submitted again
     // recently gets flagged for admin review, but is never silently dropped.
@@ -423,8 +604,8 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW(),$27,$28,$29,$30)
       RETURNING id
     `, [
-      l.name, l.phone, l.email || null, l.address || null, l.zip || null, l.state || null, l.metro || null,
-      l.territory_name, territory ? territory.id : null,
+      l.name, l.phone, l.email || null, l.address || null, zr.zip || (l.zip ? String(l.zip).slice(0, 10) : null), l.state || null, routedMetro,
+      routedName, territory ? territory.id : null,
       JSON.stringify(l.services || []), l.timeframe || null, l.insurance ? 1 : 0, l.access || null,
       l.species || null, l.height || null, l.dbh || null, l.crown || null,
       JSON.stringify(l.conditions || []), l.inspection_required ? 1 : 0,
@@ -433,6 +614,10 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
       consentVersion, req.ip || null, duplicateFlag ? 1 : 0, duplicateReason, resumeToken
     ]);
     const leadId = insertResult.rows[0].id;
+    await pool.query(
+      "UPDATE leads SET routing_basis = $1, routing_status = $2, routing_reason = $3, assigned_company_id = $4, submitted_territory_hint = $5 WHERE id = $6",
+      [routingBasis, routingStatus, routingReason, company ? company.id : null, l.territory_name ? String(l.territory_name).slice(0, 80) : null, leadId]
+    );
 
     await pool.query(
       "INSERT INTO lead_status_history (lead_id, status, changed_by, note) VALUES ($1, 'submitted', 'homeowner', $2)",
@@ -440,16 +625,15 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
     );
 
     let matchedCompany = null;
-    if (territory && territory.company_id) {
-      const { rows } = await pool.query("SELECT name, email, phone FROM companies WHERE id = $1", [territory.company_id]);
-      matchedCompany = rows[0] || null;
-      if (matchedCompany) {
-        await pool.query("UPDATE leads SET status = 'assigned' WHERE id = $1", [leadId]);
-        await pool.query(
-          "INSERT INTO lead_status_history (lead_id, status, changed_by) VALUES ($1, 'assigned', 'system')",
-          [leadId]
-        );
-      }
+    if (company) {
+      matchedCompany = { name: company.name, email: company.email, phone: company.phone };
+      await pool.query("UPDATE leads SET status = 'assigned' WHERE id = $1", [leadId]);
+      await pool.query("INSERT INTO lead_status_history (lead_id, status, changed_by) VALUES ($1, 'assigned', 'system')", [leadId]);
+    } else {
+      await pool.query(
+        "INSERT INTO lead_status_history (lead_id, status, changed_by, note) VALUES ($1, 'submitted', 'system', $2)",
+        [leadId, `Unassigned, needs manual review: ${routingReason}`]
+      );
     }
 
     // Best-effort notifications — sendEmail never throws, so a failed send
@@ -457,21 +641,22 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
     if (matchedCompany && matchedCompany.email) {
       await sendEmail({
         to: matchedCompany.email,
-        subject: `New lead: ${l.name} — ${l.territory_name}`,
-        html: companyLeadEmailHtml(l, matchedCompany, l.territory_name)
+        subject: `New lead: ${l.name} — ${routedName}`,
+        html: companyLeadEmailHtml(l, matchedCompany, routedName)
       });
     }
     if (l.email) {
       await sendEmail({
         to: l.email,
         subject: "We've got your tree estimate request",
-        html: homeownerConfirmationEmailHtml(l)
+        html: homeownerConfirmationEmailHtml(l, !!matchedCompany)
       });
     }
 
     res.status(201).json({
       lead_id: leadId,
       territory_claimed: !!matchedCompany,
+      routing_status: routingStatus,
       matched_company: matchedCompany,
       resume_token: resumeToken
     });
@@ -587,8 +772,7 @@ app.get("/api/companies/leads", async (req, res) => {
 
     const { rows: leads } = await pool.query(`
       SELECT leads.* FROM leads
-      JOIN territories ON territories.id = leads.territory_id
-      WHERE territories.company_id = $1
+      WHERE leads.assigned_company_id = $1
       ORDER BY leads.created_at DESC
     `, [company.id]);
 
@@ -627,8 +811,7 @@ app.patch("/api/leads/:id/status", async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT leads.id FROM leads
-      JOIN territories ON territories.id = leads.territory_id
-      WHERE leads.id = $1 AND territories.company_id = $2
+      WHERE leads.id = $1 AND leads.assigned_company_id = $2
     `, [req.params.id, company.id]);
     if (rows.length === 0) return res.status(404).json({ error: "Lead not found for this company." });
 
@@ -875,9 +1058,11 @@ app.get("/api/admin/leads", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
     const { rows } = await pool.query(`
-      SELECT id, name, phone, address, territory_name, status, duplicate_flag,
+      SELECT id, name, phone, address, zip, territory_name, territory_id, status, routing_status, routing_reason,
+             assigned_company_id, submitted_territory_hint, duplicate_flag,
              duplicate_reason, admin_reviewed, quote_low, quote_high, inspection_required, created_at
-      FROM leads ORDER BY created_at DESC LIMIT 200
+      FROM leads ${req.query.unassigned === "1" ? "WHERE routing_status = 'unassigned'" : ""}
+      ORDER BY created_at DESC LIMIT 200
     `);
     res.json(rows);
   } catch (err) {
@@ -938,7 +1123,7 @@ app.get("/api/admin/analytics", async (req, res) => {
       counts("SELECT COUNT(*) AS n FROM leads WHERE status = 'job_completed'"),
       counts("SELECT COUNT(*) AS n FROM leads WHERE duplicate_flag = 1"),
       counts("SELECT COUNT(*) AS n FROM leads WHERE admin_reviewed = 0"),
-      counts("SELECT COUNT(*) AS n FROM leads WHERE territory_id IS NULL"),
+      counts("SELECT COUNT(*) AS n FROM leads WHERE routing_status = 'unassigned'"),
       counts("SELECT COUNT(*) AS n FROM companies WHERE license_expiration < NOW() OR insurance_expiration < NOW()")
     ]);
     res.json({ totalLeads, assigned, accepted, completed, flaggedDuplicates, needsReview, unassigned, expiredDocs });
@@ -959,6 +1144,8 @@ app.post("/api/leads/:id/dispute", async (req, res) => {
   const { reason, detail } = req.body;
   if (!reason) return res.status(400).json({ error: "Missing reason." });
   try {
+    const { rows: own } = await pool.query("SELECT id FROM leads WHERE id = $1 AND assigned_company_id = $2", [req.params.id, company.id]);
+    if (!own.length) return res.status(404).json({ error: "Lead not found for this company." });
     await pool.query(
       "INSERT INTO lead_disputes (lead_id, company_id, reason, detail) VALUES ($1, $2, $3, $4)",
       [req.params.id, company.id, reason, detail || null]
@@ -996,6 +1183,156 @@ app.post("/api/admin/disputes/:id/resolve", async (req, res) => {
     res.json({ status });
   } catch (err) {
     res.status(500).json({ error: "Could not resolve dispute." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Admin: territory ZIP assignments and offering (x-admin-key required)
+// ---------------------------------------------------------------------------
+// POST /api/admin/territory-zips/import
+//   body: { zips?: [{zip, territory_id, status}], boundary_version? }
+//   With no "zips", loads the bundled data/nashville_zips.json draft. Upserts ZIP assignments only;
+//   it does NOT make any territory purchasable.
+app.post("/api/admin/territory-zips/import", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const fs = require("node:fs");
+    const body = req.body || {};
+    const src = Array.isArray(body.zips) ? { zips: body.zips, version: body.boundary_version } : JSON.parse(fs.readFileSync(require("node:path").join(__dirname, "data", "nashville_zips.json"), "utf8"));
+    const version = body.boundary_version || src.version || "unversioned";
+    const rows = src.zips.filter(z => /^\d{5}$/.test(String(z.zip)) && Number.isInteger(Number(z.territory_id)));
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const z of rows) {
+        await client.query(
+          `INSERT INTO territory_zips (zip, territory_id, status, boundary_version) VALUES ($1,$2,$3,$4)
+           ON CONFLICT (zip) DO UPDATE SET territory_id = EXCLUDED.territory_id, status = EXCLUDED.status, boundary_version = EXCLUDED.boundary_version`,
+          [String(z.zip), Number(z.territory_id), z.status || null, version]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); }
+    await logAudit({ actorType: "admin", action: "territory_zips_import", detail: { count: rows.length, version } });
+    res.json({ imported: rows.length, boundary_version: version });
+  } catch (err) {
+    console.error("[admin/territory-zips/import] Failed:", err);
+    res.status(500).json({ error: "Could not import ZIP assignments." });
+  }
+});
+
+// POST /api/admin/leads/:id/assign   body: { territory_id }
+//   Manual-review queue action: a person routes an unassigned lead to a territory whose company is eligible.
+app.post("/api/admin/leads/:id/assign", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const tid = Number(req.body.territory_id);
+  if (!Number.isInteger(tid)) return res.status(400).json({ error: "Provide territory_id." });
+  try {
+    const { rows: tr } = await pool.query("SELECT * FROM territories WHERE id = $1", [tid]);
+    const t = tr[0];
+    if (!t || !t.company_id) return res.status(400).json({ error: "That territory has no company." });
+    const { rows: cr } = await pool.query("SELECT * FROM companies WHERE id = $1", [t.company_id]);
+    if (!companyEligible(cr[0])) return res.status(400).json({ error: "That territory's company is not eligible (verified license and insurance, accepting leads)." });
+    const { rowCount } = await pool.query(
+      "UPDATE leads SET territory_id = $1, territory_name = $2, metro = $3, assigned_company_id = $4, routing_status = 'assigned', routing_reason = NULL, routing_basis = 'manual', status = 'assigned' WHERE id = $5 AND routing_status = 'unassigned'",
+      [t.id, t.name, t.metro, t.company_id, req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: "Lead not found or already assigned." });
+    await pool.query("INSERT INTO lead_status_history (lead_id, status, changed_by, note) VALUES ($1, 'assigned', 'admin', 'Manually assigned from review queue')", [req.params.id]);
+    await logAudit({ actorType: "admin", action: "lead_manual_assign", targetType: "lead", targetId: req.params.id, detail: { territory_id: t.id } });
+    res.json({ assigned: true, company_id: t.company_id });
+  } catch (err) {
+    console.error("[admin/leads/assign] Failed:", err);
+    res.status(500).json({ error: "Could not assign lead." });
+  }
+});
+
+// POST /api/admin/companies/:id/status   body: { status: "active" | "suspended" | "canceled" }
+//   Manual account state (e.g. after a cancelled subscription). Non-active companies receive no automatic leads.
+app.post("/api/admin/companies/:id/status", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const status = req.body.status;
+  if (!["active", "suspended", "canceled"].includes(status)) return res.status(400).json({ error: "status must be active, suspended or canceled." });
+  try {
+    const { rowCount } = await pool.query("UPDATE companies SET account_status = $1 WHERE id = $2", [status, req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: "Company not found." });
+    await logAudit({ actorType: "admin", action: "company_status", targetType: "company", targetId: req.params.id, detail: { status } });
+    res.json({ status });
+  } catch (err) {
+    res.status(500).json({ error: "Could not update company status." });
+  }
+});
+
+// POST /api/admin/territories/display-names   body: { names: { "1": "Nashville / Davidson County", ... } }
+//   Display names are cosmetic. Ids, names (routing keys) and ZIP assignments are untouched.
+// POST /api/admin/territories/merge  { from_ids: [2,4], into_id: 3, display_name?: "Williamson County" }
+// Folds territories into one. ZIP assignments, lead activity and routing move to into_id; the old territory rows are kept
+// (history) but retired: hidden, never offered, never sold. Refused if a retired-to-be territory already has a company.
+app.post("/api/admin/territories/merge", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const from = [...new Set((req.body.from_ids || []).map(Number))], into = Number(req.body.into_id);
+  if (!from.length || !Number.isInteger(into) || from.includes(into) || from.some(n => !Number.isInteger(n))) return res.status(400).json({ error: "Provide from_ids (array) and into_id; into_id must not be in from_ids." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows: ts } = await client.query("SELECT id, company_id, retired FROM territories WHERE id = ANY($1) FOR UPDATE", [[...from, into]]);
+    if (ts.length !== from.length + 1) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Unknown territory id." }); }
+    if (ts.some(t => t.retired === 1)) { await client.query("ROLLBACK"); return res.status(409).json({ error: "A territory involved is already retired." }); }
+    if (ts.some(t => from.includes(t.id) && t.company_id)) { await client.query("ROLLBACK"); return res.status(409).json({ error: "A territory being merged already has a company. Resolve ownership first." }); }
+    const z = await client.query("UPDATE territory_zips SET territory_id = $1 WHERE territory_id = ANY($2)", [into, from]);
+    const l = await client.query("UPDATE leads SET territory_id = $1 WHERE territory_id = ANY($2)", [into, from]);
+    await client.query("UPDATE territories SET retired = 1, offered = 0 WHERE id = ANY($1)", [from]);
+    await client.query("UPDATE territories SET offered = 0 WHERE id = $1", [into]);   // the merged territory must be re-approved
+    if (typeof req.body.display_name === "string" && req.body.display_name.trim()) await client.query("UPDATE territories SET display_name = $1 WHERE id = $2", [req.body.display_name.trim().slice(0, 80), into]);
+    await client.query("COMMIT");
+    await logAudit({ actorType: "admin", action: "territories_merged", targetType: "territory", targetId: into, detail: { from, zips_moved: z.rowCount, leads_moved: l.rowCount } });
+    res.json({ merged_into: into, retired: from, zips_moved: z.rowCount, leads_moved: l.rowCount });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[territories/merge] Failed:", err);
+    res.status(500).json({ error: "Could not merge territories." });
+  } finally { client.release(); }
+});
+
+app.post("/api/admin/territories/display-names", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const names = req.body.names || {};
+  try {
+    let n = 0;
+    for (const [id, name] of Object.entries(names)) {
+      if (!Number.isInteger(Number(id)) || typeof name !== "string" || name.length > 80) continue;
+      n += (await pool.query("UPDATE territories SET display_name = $1 WHERE id = $2", [name.trim() || null, Number(id)])).rowCount;
+    }
+    await logAudit({ actorType: "admin", action: "territory_display_names", detail: names });
+    res.json({ updated: n });
+  } catch (err) {
+    res.status(500).json({ error: "Could not update display names." });
+  }
+});
+
+// POST /api/admin/territories/offer   body: { territory_ids: [..], offered: true|false, boundary_version? }
+//   Confirms (or withdraws) territories. A territory can only be offered once it has ZIP assignments.
+//   Withdrawing never touches territories that are already claimed.
+app.post("/api/admin/territories/offer", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const ids = Array.isArray(req.body.territory_ids) ? [...new Set(req.body.territory_ids.map(Number))] : [];
+  if (!ids.length || ids.some(n => !Number.isInteger(n))) return res.status(400).json({ error: "Provide territory_ids." });
+  const offered = req.body.offered === true;
+  try {
+    if (offered) {
+      const { rows } = await pool.query("SELECT territory_id, COUNT(*) AS n FROM territory_zips WHERE territory_id = ANY($1) GROUP BY territory_id", [ids]);
+      const have = new Set(rows.map(r => r.territory_id));
+      const missing = ids.filter(i => !have.has(i));
+      if (missing.length) return res.status(400).json({ error: "These territories have no ZIP assignments yet.", territory_ids: missing });
+    } else {
+      const { rows } = await pool.query("SELECT name FROM territories WHERE id = ANY($1) AND company_id IS NOT NULL", [ids]);
+      if (rows.length) return res.status(400).json({ error: "Cannot withdraw territories that are already claimed.", names: rows.map(r => r.name) });
+    }
+    const { rowCount } = await pool.query("UPDATE territories SET offered = $1, boundary_version = COALESCE($2, boundary_version) WHERE id = ANY($3)", [offered ? 1 : 0, req.body.boundary_version || null, ids]);
+    await logAudit({ actorType: "admin", action: offered ? "territories_offered" : "territories_withdrawn", detail: { ids, boundary_version: req.body.boundary_version || null } });
+    res.json({ updated: rowCount, offered });
+  } catch (err) {
+    console.error("[admin/territories/offer] Failed:", err);
+    res.status(500).json({ error: "Could not update territories." });
   }
 });
 
