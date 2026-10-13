@@ -1312,6 +1312,35 @@ app.post("/api/admin/territories/display-names", async (req, res) => {
 // POST /api/admin/territories/offer   body: { territory_ids: [..], offered: true|false, boundary_version? }
 //   Confirms (or withdraws) territories. A territory can only be offered once it has ZIP assignments.
 //   Withdrawing never touches territories that are already claimed.
+// POST /api/admin/territories/release   body: { territory_id, offered?: false }
+//   Takes a territory back from its company (e.g. removing a test purchase). If that leaves the company with no territories,
+//   its Stripe subscription is cancelled and the account marked canceled. Leads already assigned keep their history.
+app.post("/api/admin/territories/release", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const tid = Number(req.body.territory_id);
+  if (!Number.isInteger(tid)) return res.status(400).json({ error: "Provide territory_id." });
+  try {
+    const { rows } = await pool.query("SELECT id, name, company_id FROM territories WHERE id = $1", [tid]);
+    if (!rows.length) return res.status(404).json({ error: "Territory not found." });
+    const companyId = rows[0].company_id;
+    if (!companyId) return res.status(409).json({ error: "Territory has no company." });
+    await pool.query("UPDATE territories SET company_id = NULL, offered = $1 WHERE id = $2", [req.body.offered === true ? 1 : 0, tid]);
+    const left = await pool.query("SELECT COUNT(*)::int AS n FROM territories WHERE company_id = $1", [companyId]);
+    let cancelled = false, stripeNote = null;
+    if (left.rows[0].n === 0) {
+      await pool.query("UPDATE companies SET account_status = 'canceled' WHERE id = $1", [companyId]);
+      const c = await pool.query("SELECT stripe_subscription_id FROM companies WHERE id = $1", [companyId]);
+      const sub = c.rows[0] && c.rows[0].stripe_subscription_id;
+      if (sub && stripe) { try { await stripe.subscriptions.cancel(sub); cancelled = true; } catch (e) { stripeNote = "Could not cancel the Stripe subscription: " + e.message; } }
+    }
+    await logAudit({ actorType: "admin", action: "territory_released", targetType: "territory", targetId: tid, detail: { company_id: companyId, subscription_cancelled: cancelled } });
+    res.json({ released: tid, company_id: companyId, subscription_cancelled: cancelled, note: stripeNote });
+  } catch (err) {
+    console.error("[admin/territories/release] Failed:", err);
+    res.status(500).json({ error: "Could not release territory." });
+  }
+});
+
 app.post("/api/admin/territories/offer", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const ids = Array.isArray(req.body.territory_ids) ? [...new Set(req.body.territory_ids.map(Number))] : [];
