@@ -272,9 +272,12 @@ module.exports = function initBids(d) {
     // Charge the bidder first. If this fails, nothing else changes.
     let sub;
     try {
+      // Subscriptions (unlike Checkout) cannot take an inline product, so make a real one carrying the territory tag.
+      const prod = await stripe.products.create({ name: `CanopyBid territory — ${label(t)}`, metadata: { territory_id: String(t.id) } });
       sub = await stripe.subscriptions.create({
         customer: bid.stripe_customer_id, default_payment_method: bid.payment_method_id,
-        items: [lineItem(t, bid.amount)], payment_behavior: "error_if_incomplete"
+        items: [{ price_data: { currency: "usd", recurring: { interval: "month" }, unit_amount: bid.amount * 100, product: prod.id }, quantity: 1 }],
+        payment_behavior: "error_if_incomplete"
       });
     } catch (e) { console.error("[bids/resolve] charge failed:", e.message); return fail("card declined or Stripe error"); }
 
