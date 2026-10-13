@@ -246,13 +246,20 @@ Other rules:
 app.get("/api/territories", async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT t.id, t.state, t.metro, t.name, t.factor, t.offered, t.boundary_version, t.display_name, c.name AS company_name
+      SELECT t.id, t.state, t.metro, t.name, t.factor, t.offered, t.boundary_version, t.display_name, t.current_price, c.name AS company_name
       FROM territories t
       LEFT JOIN companies c ON c.id = t.company_id
       WHERE COALESCE(t.retired, 0) = 0
       ORDER BY t.metro, t.name
     `);
-    const withPricing = rows.map(r => ({ ...r, offered: r.offered === 1, monthly_price: territoryMonthlyPrice(r.factor) }));
+    await bids.resolveDueBids().catch(() => {});   // overdue match windows are settled whenever the list is loaded (the server may have been asleep)
+    const open = await bids.publicBidInfo();
+    const withPricing = rows.map(r => {
+      const price = bids.priceOf(r), claimed = !!r.company_name;
+      const { current_price, ...pub } = r;
+      return { ...pub, offered: r.offered === 1, monthly_price: price,
+        min_bid: claimed ? Math.max(price, open[r.id] || 0) + bids.MIN_STEP : null, bid_open: claimed && open[r.id] != null };
+    });
     res.json(withPricing);
   } catch (err) {
     console.error("[territories] Failed:", err);
@@ -371,7 +378,7 @@ app.post("/api/checkout/create", publicLimiter, async (req, res) => {
         currency: "usd",
         recurring: { interval: "month" },
         unit_amount: territoryMonthlyPrice(t.factor) * 100,
-        product_data: { name: `CanopyBid territory — ${t.metro}: ${t.display_name || t.name}` }
+        product_data: { name: `CanopyBid territory — ${t.metro}: ${t.display_name || t.name}`, metadata: { territory_id: String(t.id) } }
       },
       quantity: 1
     }));
@@ -453,7 +460,7 @@ async function fulfilSession(session) {
     const companyId = ins.rows[0].id;
     const claimed = [], failedToClaim = [];
     for (const tId of ids) {
-      const r = await client.query("UPDATE territories SET company_id = $1 WHERE id = $2 AND company_id IS NULL AND offered = 1 RETURNING id", [companyId, tId]);
+      const r = await client.query("UPDATE territories SET company_id = $1, stripe_subscription_id = $3, current_price = NULL WHERE id = $2 AND company_id IS NULL AND offered = 1 RETURNING id", [companyId, tId, session.subscription || null]);
       (r.rowCount > 0 ? claimed : failedToClaim).push(tId);
     }
     await client.query("UPDATE checkout_reservations SET status = 'completed' WHERE session_id = $1", [session.id]);
@@ -480,7 +487,11 @@ async function stripeWebhook(req, res) {
     if (!seen.rowCount) return res.json({ received: true, duplicate: true });
     try {
       const obj = event.data.object;
-      if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
+      if (event.type === "checkout.session.completed" && obj.mode === "setup") {
+        await bids.activateBidFromSession(obj);                       // a bidder saved their card
+      } else if (event.type === "checkout.session.expired" && obj.mode === "setup") {
+        await bids.expireBidSession(obj);
+      } else if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
         if (obj.payment_status === "paid") await fulfilSession(obj);
       } else if (event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
         await pool.query("UPDATE checkout_reservations SET status = 'expired' WHERE session_id = $1 AND status = 'pending'", [obj.id]);
@@ -1324,7 +1335,8 @@ app.post("/api/admin/territories/release", async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Territory not found." });
     const companyId = rows[0].company_id;
     if (!companyId) return res.status(409).json({ error: "Territory has no company." });
-    await pool.query("UPDATE territories SET company_id = NULL, offered = $1 WHERE id = $2", [req.body.offered === true ? 1 : 0, tid]);
+    await pool.query("UPDATE territories SET company_id = NULL, offered = $1, current_price = NULL, stripe_subscription_id = NULL WHERE id = $2", [req.body.offered === true ? 1 : 0, tid]);
+    await pool.query("UPDATE bids SET status = 'canceled', resolved_at = NOW(), resolved_note = 'territory released by admin' WHERE territory_id = $1 AND status IN ('pending_setup','active')", [tid]);
     const left = await pool.query("SELECT COUNT(*)::int AS n FROM territories WHERE company_id = $1", [companyId]);
     let cancelled = false, stripeNote = null;
     if (left.rows[0].n === 0) {
@@ -1365,11 +1377,14 @@ app.post("/api/admin/territories/offer", async (req, res) => {
   }
 });
 
+const bids = require("./bids")({ app, pool, stripe, sendEmail, requireAdmin, authCompany, limiter: publicLimiter, logAudit, basePrice: territoryMonthlyPrice, FRONTEND_URL });
+
 app.get("/", (req, res) => {
   res.json({ status: "CanopyBid backend is running." });
 });
 
 initDb()
+  .then(() => bids.schema())
   .then(() => {
     app.listen(PORT, () => {
       console.log(`CanopyBid backend listening on port ${PORT}`);
