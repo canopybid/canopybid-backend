@@ -330,7 +330,16 @@ module.exports = function initBids(d) {
 
   app.post("/api/admin/bids/resolve", async (req, res) => {
     if (!requireAdmin(req, res)) return;
-    try { res.json({ resolved: await resolveDueBids(true) }); } catch (e) { res.status(500).json({ error: "Could not resolve bids." }); }
+    try {
+      // Test shortcut: end one bid's 72-hour window now. Refused unless Stripe is in test mode, so it can never touch live money.
+      const b = req.body || {};
+      if (b.end_window_now) {
+        if (!String(process.env.STRIPE_SECRET_KEY || "").startsWith("sk_test_")) return res.status(403).json({ error: "Only available while Stripe is in test mode." });
+        const u = await pool.query("UPDATE bids SET match_deadline = NOW() - INTERVAL '1 second' WHERE id = $1 AND status = 'active'", [Number(b.bid_id)]);
+        if (!u.rowCount) return res.status(404).json({ error: "No active bid with that id." });
+      }
+      res.json({ resolved: await resolveDueBids(true) });
+    } catch (e) { res.status(500).json({ error: "Could not resolve bids." }); }
   });
   app.get("/api/admin/bids", async (req, res) => {
     if (!requireAdmin(req, res)) return;
