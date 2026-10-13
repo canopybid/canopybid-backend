@@ -234,7 +234,9 @@ module.exports = function initBids(d) {
       const { item } = await findItem(subId, t.id);
       if (!item) { await client.query("ROLLBACK"); return res.status(409).json({ error: "Could not find this territory on your subscription. Contact support." }); }
       // Raise the owner's own price to the bid. No proration: the new price starts at the next billing date.
-      await stripe.subscriptions.update(subId, { proration_behavior: "none", items: [{ id: item.id, price_data: { currency: "usd", recurring: { interval: "month" }, unit_amount: bid.amount * 100, product: (item.price.product && item.price.product.id) || item.price.product } }] });
+      // Products created inline by Checkout are inactive in Stripe and cannot take new prices, so make a fresh active product carrying the same territory tag.
+      const prod = await stripe.products.create({ name: `CanopyBid territory — ${label(t)}`, metadata: { territory_id: String(t.id) } });
+      await stripe.subscriptions.update(subId, { proration_behavior: "none", items: [{ id: item.id, price_data: { currency: "usd", recurring: { interval: "month" }, unit_amount: bid.amount * 100, product: prod.id } }] });
       await client.query("UPDATE territories SET current_price = $1 WHERE id = $2", [bid.amount, t.id]);
       await client.query("UPDATE bids SET status = 'matched', resolved_at = NOW(), resolved_note = 'owner matched' WHERE id = $1", [bid.id]);
       await client.query("COMMIT");
