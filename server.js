@@ -151,7 +151,8 @@ app.post("/api/analyze", publicLimiter, async (req, res) => {
 
   const slotLabels = {
     full: "Full tree, entire height visible",
-    base: "Trunk at ground level — the homeowner was asked to press their palm flat against the bark, facing the camera, for scale",
+    base: "Trunk with the homeowner's palm pressed flat against the bark at chest height, for scale",
+    surroundings: "Surrounding area — what is around the tree (house, fences, power lines, driveway, yard)",
     canopy: "Looking up into the canopy",
     house: "Tree in relation to the house",
     access: "Path from the street or driveway to the tree",
@@ -166,7 +167,7 @@ app.post("/api/analyze", publicLimiter, async (req, res) => {
   "notes": string
 }
 Rules on sizing, which matters most:
-- Look closely at the "Trunk at ground level" photo for a hand pressed flat against the bark. A typical adult palm is roughly 3.5-4 inches wide across the base of the fingers. If a hand is visible flat against the trunk, use it to calculate height and DBH from the pixel proportions as precisely as you can, and keep the range reasonably tight (roughly ±10-15%). Set scale_reference_present to true.
+- Look closely at the "Trunk with the homeowner's palm pressed flat against the bark" photo for a hand pressed flat against the bark. A typical adult palm is roughly 3.5-4 inches wide across the base of the fingers. If a hand is visible flat against the trunk, use it to calculate height and DBH from the pixel proportions as precisely as you can, and keep the range reasonably tight (roughly ±10-15%). Set scale_reference_present to true.
 - If the hand looks held out toward the camera rather than flat against the bark (it will look noticeably larger relative to the trunk than a flat palm would), treat the reference as unreliable rather than using it directly.
 - If no hand or other reference is visible against the trunk, DO NOT default to "typical" size for the species. Instead, say so explicitly in "notes", set scale_reference_present to false, and widen both ranges substantially (at least ±40%) to reflect real uncertainty.
 - Never present a confident-looking narrow range when you are actually guessing from species norms rather than measuring the photo.
@@ -787,6 +788,8 @@ app.get("/api/companies/leads", async (req, res) => {
       ORDER BY leads.created_at DESC
     `, [company.id]);
 
+    const mc = await media.countsFor(leads.map(l => l.id));
+    leads.forEach(l => { l.media = mc[l.id] || { photos: 0, video: 0 }; });
     res.json({ company: { id: company.id, name: company.name }, leads });
   } catch (err) {
     console.error("[companies/leads] Failed:", err);
@@ -1075,6 +1078,8 @@ app.get("/api/admin/leads", async (req, res) => {
       FROM leads ${req.query.unassigned === "1" ? "WHERE routing_status = 'unassigned'" : ""}
       ORDER BY created_at DESC LIMIT 200
     `);
+    const mc = await media.countsFor(rows.map(l => l.id));
+    rows.forEach(l => { l.media = mc[l.id] || { photos: 0, video: 0 }; });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: "Could not load leads." });
@@ -1377,6 +1382,7 @@ app.post("/api/admin/territories/offer", async (req, res) => {
   }
 });
 
+const media = require("./media")({ app, pool, express, authCompany, requireAdmin, limiter: publicLimiter, logAudit });
 const bids = require("./bids")({ app, pool, stripe, sendEmail, requireAdmin, authCompany, limiter: publicLimiter, logAudit, basePrice: territoryMonthlyPrice, FRONTEND_URL });
 
 app.get("/", (req, res) => {
@@ -1385,6 +1391,7 @@ app.get("/", (req, res) => {
 
 initDb()
   .then(() => bids.schema())
+  .then(() => media.schema())
   .then(() => {
     app.listen(PORT, () => {
       console.log(`CanopyBid backend listening on port ${PORT}`);
