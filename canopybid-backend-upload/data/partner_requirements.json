@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "_note": "Which documents a partner must have VERIFIED by an admin before it can pay for a territory and receive automatic leads. required = (market override, else default) OR any offered service that requires it. This file is configuration, not legal advice: set it to what your market actually requires, then restart the backend. Companies that existed before this file keep the original rule (license AND insurance).",
+  "defaults": {
+    "license": { "required": false },
+    "insurance": { "required": true }
+  },
+  "markets": {
+    "Nashville": {
+      "license": { "required": false },
+      "insurance": { "required": true }
+    }
+  },
+  "services": {
+    "Removal": {},
+    "Trimming / pruning": {},
+    "Stump grinding": {},
+    "Storm damage cleanup": {}
+  }
+}
