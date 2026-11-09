@@ -14,7 +14,7 @@ module.exports = function initMedia(d) {
   const MAX_PHOTO_BYTES = 3 * 1024 * 1024;
   const MAX_PHOTOS = 12;
   const LINK_MINUTES = 20;
-  const SLOTS = new Set(["full", "base", "surroundings", "canopy", "house", "access", "lines"]);
+  const SLOTS = new Set(["full", "base", "surroundings", "canopy", "house", "access", "lines", "distance"]);
   const SECRET = crypto.randomBytes(32); // links die on restart, which is fine: they only live minutes
   const sign = (id, exp) => crypto.createHmac("sha256", SECRET).update(`${id}.${exp}`).digest("hex").slice(0, 32);
   const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
@@ -56,8 +56,9 @@ module.exports = function initMedia(d) {
     const id = Number(req.params.id);
     const token = String(req.query.token || "");
     if (!Number.isInteger(id) || token.length < 20) return null;
-    const { rows } = await pool.query("SELECT id, resume_token FROM leads WHERE id = $1", [id]);
+    const { rows } = await pool.query("SELECT id, resume_token, resume_issued_at, created_at FROM leads WHERE id = $1 AND deleted_at IS NULL", [id]);
     if (!rows[0] || !rows[0].resume_token || !safeEq(rows[0].resume_token, token)) return null;
+    { const t = new Date(rows[0].resume_issued_at || rows[0].created_at).getTime(); if (!t || t + Number(process.env.LEAD_LINK_DAYS || 90) * 864e5 < Date.now()) return null; }
     return rows[0];
   }
 
@@ -121,11 +122,15 @@ module.exports = function initMedia(d) {
     try {
       const id = Number(req.params.id);
       if (!Number.isInteger(id)) return res.status(400).json({ error: "Bad lead id." });
-      if (req.header("x-admin-key")) { if (!requireAdmin(req, res)) return; }
-      else {
+      // A deleted request has no photos or videos for anyone: companies and admins alike get "not found" (enforced here, not just by the rows being gone).
+      if (req.header("x-admin-key")) {
+        if (!requireAdmin(req, res)) return;
+        const { rows: lr } = await pool.query("SELECT 1 FROM leads WHERE id = $1 AND deleted_at IS NULL", [id]);
+        if (!lr.length) return res.status(404).json({ error: "Lead not found." });
+      } else {
         const co = await authCompany(req);
         if (!co) return res.status(401).json({ error: "Invalid API key." });
-        const { rows: lr } = await pool.query("SELECT 1 FROM leads WHERE id = $1 AND assigned_company_id = $2", [id, co.id]);
+        const { rows: lr } = await pool.query("SELECT 1 FROM leads WHERE id = $1 AND assigned_company_id = $2 AND deleted_at IS NULL", [id, co.id]);
         if (!lr.length) return res.status(404).json({ error: "Lead not found." });
       }
       const { rows } = await pool.query("SELECT id, tree_index, kind, slot, content_type, size_bytes FROM lead_media WHERE lead_id = $1 ORDER BY kind DESC, tree_index, id", [id]);
@@ -139,8 +144,8 @@ module.exports = function initMedia(d) {
     try {
       const id = Number(req.params.mediaId), exp = Number(req.query.e);
       if (!Number.isInteger(id) || !exp || exp < Date.now() || !safeEq(sign(id, exp), req.query.s || "")) return res.status(403).send("Link expired.");
-      const { rows } = await pool.query("SELECT content_type, data FROM lead_media WHERE id = $1", [id]);
-      if (!rows[0]) return res.status(404).send("Not found.");
+      const { rows } = await pool.query("SELECT m.content_type, m.data FROM lead_media m JOIN leads l ON l.id = m.lead_id WHERE m.id = $1 AND l.deleted_at IS NULL", [id]);
+      if (!rows[0]) return res.status(404).send("Not found.");   // also covers a link issued before the request was deleted
       const buf = rows[0].data, total = buf.length;
       res.set({ "Content-Type": rows[0].content_type, "Accept-Ranges": "bytes", "Cache-Control": "private, max-age=600", "X-Content-Type-Options": "nosniff" });
       const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || "");

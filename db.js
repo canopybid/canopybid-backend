@@ -144,6 +144,10 @@ async function initDb() {
   // At most ONE live reservation per territory, enforced by the database itself (safe under concurrent checkouts).
   await pool.query("ALTER TABLE checkout_reservations ADD COLUMN IF NOT EXISTS buyer_email TEXT");
   await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS uq_reservation_pending ON checkout_reservations (territory_id) WHERE status = 'pending'");
+  await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS agreement_version TEXT");
+  await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS agreement_accepted_at TIMESTAMP");
+  await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS agreement_accepted_name TEXT");
+  await pool.query("CREATE TABLE IF NOT EXISTS company_agreement_acceptances (id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), version TEXT NOT NULL, accepted_name TEXT NOT NULL, accepted_ip TEXT, accepted_at TIMESTAMP NOT NULL DEFAULT NOW())");
   await pool.query("CREATE TABLE IF NOT EXISTS stripe_events (id TEXT PRIMARY KEY, type TEXT, received_at TIMESTAMP DEFAULT NOW())");
   await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS suspended_by_billing INTEGER DEFAULT 0");
   await pool.query("ALTER TABLE companies ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT");
@@ -221,6 +225,23 @@ async function initDb() {
       resolved_at TIMESTAMP
     );
   `);
+
+  // Misroute log: one row per request that a company or the admin says landed in the wrong place. Used only to decide
+  // whether to add address checking (see TERRITORY_MODEL.md). kind: misrouted | boundary_complaint.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS routing_issues (
+      id SERIAL PRIMARY KEY,
+      lead_id INTEGER REFERENCES leads(id),
+      company_id INTEGER REFERENCES companies(id),
+      zip TEXT,
+      territory_id INTEGER,
+      kind TEXT NOT NULL,
+      source TEXT NOT NULL,
+      note TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query("CREATE INDEX IF NOT EXISTS idx_routing_issues_created ON routing_issues(created_at)");
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS email_verifications (

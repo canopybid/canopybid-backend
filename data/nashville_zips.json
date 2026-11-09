@@ -1,7 +1,7 @@
 {
- "version": "2026-10-10-draft",
+ "version": "2026-10-23-pilot",
  "market": "Nashville",
- "note": "Only ZIPs NOT on hold. The 41 held ZIPs are in nashville_zips_on_hold.json and must not be imported until approved.",
+ "note": "Pilot ZIP assignments, owner decisions of 2026-10-23 recorded in nashville_review_table.csv. 'assigned' = whole ZIP routes automatically once its territory is offered and owned. 'review' = boundary unclear, never auto-routed, manual review. 'held' = not offered, treated as not covered. Routing is by ZIP only, not address-verified. Loading this file does not make any territory purchasable.",
  "zips": [
   {
    "zip": "37010",
@@ -25,7 +25,7 @@
    "zip": "37014",
    "territory": "Williamson Central",
    "territory_id": 3,
-   "status": "assigned"
+   "status": "held"
   },
   {
    "zip": "37015",
@@ -61,7 +61,7 @@
    "zip": "37031",
    "territory": "Sumner",
    "territory_id": 7,
-   "status": "assigned"
+   "status": "held"
   },
   {
    "zip": "37032",
@@ -109,7 +109,7 @@
    "zip": "37051",
    "territory": "Dickson",
    "territory_id": 9,
-   "status": "assigned"
+   "status": "held"
   },
   {
    "zip": "37055",
@@ -127,7 +127,7 @@
    "zip": "37060",
    "territory": "Rutherford",
    "territory_id": 5,
-   "status": "assigned"
+   "status": "held"
   },
   {
    "zip": "37062",
@@ -139,7 +139,7 @@
    "zip": "37063",
    "territory": "Rutherford",
    "territory_id": 5,
-   "status": "assigned"
+   "status": "review"
   },
   {
    "zip": "37064",
@@ -187,7 +187,7 @@
    "zip": "37071",
    "territory": "Wilson",
    "territory_id": 6,
-   "status": "assigned"
+   "status": "review"
   },
   {
    "zip": "37072",
@@ -229,7 +229,7 @@
    "zip": "37082",
    "territory": "Robertson/Cheatham",
    "territory_id": 8,
-   "status": "assigned"
+   "status": "held"
   },
   {
    "zip": "37085",
@@ -289,7 +289,7 @@
    "zip": "37119",
    "territory": "Sumner",
    "territory_id": 7,
-   "status": "assigned"
+   "status": "review"
   },
   {
    "zip": "37121",
@@ -355,7 +355,7 @@
    "zip": "37136",
    "territory": "Wilson",
    "territory_id": 6,
-   "status": "assigned"
+   "status": "review"
   },
   {
    "zip": "37138",
@@ -391,7 +391,7 @@
    "zip": "37152",
    "territory": "Robertson/Cheatham",
    "territory_id": 8,
-   "status": "assigned"
+   "status": "review"
   },
   {
    "zip": "37153",
@@ -421,7 +421,7 @@
    "zip": "37174",
    "territory": "Williamson Central",
    "territory_id": 3,
-   "status": "assigned"
+   "status": "review"
   },
   {
    "zip": "37179",
@@ -445,7 +445,7 @@
    "zip": "37186",
    "territory": "Sumner",
    "territory_id": 7,
-   "status": "assigned"
+   "status": "held"
   },
   {
    "zip": "37187",
@@ -457,7 +457,7 @@
    "zip": "37188",
    "territory": "Robertson/Cheatham",
    "territory_id": 8,
-   "status": "assigned"
+   "status": "review"
   },
   {
    "zip": "37189",

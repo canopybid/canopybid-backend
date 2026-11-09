@@ -1,12 +1,34 @@
 require("dotenv").config();
+
+// Test-kit safety. The real-Stripe test kit starts this server with CANOPYBID_TEST_KIT=1. In that mode the server refuses to
+// run unless it is clearly local and harmless: a Stripe TEST key, a database on this computer whose name says scratch/test/tmp/dev,
+// and no email key (so no real person can be emailed). It never changes behaviour when the variable is unset (production).
+if (process.env.CANOPYBID_TEST_KIT === "1") {
+  const problems = [];
+  if (!String(process.env.STRIPE_SECRET_KEY || "").startsWith("sk_test_")) problems.push("STRIPE_SECRET_KEY must be a sk_test_ key");
+  try { const u = new URL(process.env.DATABASE_URL || ""); const name = decodeURIComponent(u.pathname.replace(/^\//, ""));
+    if (!["localhost", "127.0.0.1", "[::1]", "::1"].includes(u.hostname)) problems.push("DATABASE_URL must point at this computer (localhost)");
+    if (!/(scratch|test|tmp|dev)/i.test(name)) problems.push("the database name must contain scratch, test, tmp or dev");
+  } catch (e) { problems.push("DATABASE_URL is missing or not a valid URL"); }
+  if (process.env.RESEND_API_KEY) problems.push("RESEND_API_KEY must be unset (the test kit must not send real email)");
+  if (problems.length) { console.error("TEST KIT SAFETY STOP: " + problems.join("; ") + ". Nothing was started."); process.exit(1); }
+  console.log("[test-kit] safety checks passed: Stripe TEST key, local scratch database, email off.");
+}
 const express = require("express");
 const cors = require("cors");
 const crypto = require("node:crypto");
 const { pool, initDb } = require("./db");
+const R = require("./requirements");
+const apiKeys = require("./apikeys");
+// the company columns eligibility needs (never the document bodies)
+const ELIG_COLS = "id, account_status, accepting_leads, required_docs, license_status, license_expiration, license_verified_at, license_filename, insurance_status, insurance_expiration, insurance_verified_at, insurance_filename, agreement_version";
 
 const rateLimit = require("express-rate-limit");
 
 const app = express();
+// Render (and most hosts) put one proxy in front of the app. Trusting exactly one hop makes req.ip the visitor's real address, so the rate
+// limiters below count each visitor separately instead of putting everyone in one shared bucket (and consent_ip records the visitor, not the proxy).
+app.set("trust proxy", Number(process.env.TRUST_PROXY_HOPS === undefined ? 1 : process.env.TRUST_PROXY_HOPS));
 app.use(cors());
 
 // Rate limiting on public-facing endpoints — someone hammering the leads or
@@ -46,9 +68,12 @@ const EMAIL_FROM = process.env.EMAIL_FROM || "CanopyBid <onboarding@resend.dev>"
 
 // Sends an email via Resend. Never throws — a notification failure should
 // never block a lead submission or checkout from succeeding.
+// Server logs are kept by the host for days to weeks, so they must not carry homeowner contact details or names.
+const maskAddr = a => String(a || "").replace(/^(.).*(@.*)$/, "$1***$2");
+const logSubject = s => String(s || "").replace(/^(New lead:).*$/i, "$1 [name hidden]");
 async function sendEmail({ to, subject, html }) {
   if (!RESEND_API_KEY) {
-    console.warn(`[email] RESEND_API_KEY not set — skipping email to ${to} ("${subject}").`);
+    console.warn(`[email] RESEND_API_KEY not set — skipping email to ${maskAddr(to)} ("${logSubject(subject)}").`);
     return { skipped: true };
   }
   try {
@@ -59,18 +84,18 @@ async function sendEmail({ to, subject, html }) {
     });
     const data = await res.json();
     if (!res.ok) {
-      console.error(`[email] Failed to send to ${to}:`, data);
+      console.error(`[email] Failed to send to ${maskAddr(to)}:`, data && data.message ? data.message : "error");
       return { error: data };
     }
-    console.log(`[email] Sent to ${to}: "${subject}"`);
+    console.log(`[email] Sent to ${maskAddr(to)}: "${logSubject(subject)}"`);
     return { success: true, id: data.id };
   } catch (err) {
-    console.error(`[email] Failed to send to ${to}:`, err);
+    console.error(`[email] Failed to send to ${maskAddr(to)}:`, String(err && err.message || err));
     return { error: String(err) };
   }
 }
 
-function companyLeadEmailHtml(l, company, matchedTerritory) {
+function companyLeadEmailHtml(l, company, matchedTerritory, requestNumber) {
   const treeCount = (l.trees || []).length || 1;
   const priceLine = l.quote_low ? `$${Number(l.quote_low).toLocaleString()} – $${Number(l.quote_high).toLocaleString()}` : "Inspection needed before pricing";
   return `
@@ -81,19 +106,21 @@ function companyLeadEmailHtml(l, company, matchedTerritory) {
       <div style="border:1px solid #eee; border-top:none; padding:22px 24px; border-radius:0 0 10px 10px;">
         <p style="font-size:15px; margin:0 0 14px;">A homeowner just accepted a preliminary estimate in your territory. Fast responses win more jobs — most homeowners contact more than one option if they don't hear back quickly.</p>
         <table style="width:100%; font-size:14px; border-collapse:collapse;">
-          <tr><td style="padding:4px 0; color:#76856E;">Name</td><td style="padding:4px 0; font-weight:bold;">${l.name}</td></tr>
-          <tr><td style="padding:4px 0; color:#76856E;">Phone</td><td style="padding:4px 0; font-weight:bold;">${l.phone}</td></tr>
-          <tr><td style="padding:4px 0; color:#76856E;">Address</td><td style="padding:4px 0;">${l.address || "—"}</td></tr>
+          ${requestNumber ? `<tr><td style="padding:4px 0; color:#76856E;">Request number</td><td style="padding:4px 0; font-weight:bold;">#${Number(requestNumber)}</td></tr>` : ""}
+          <tr><td style="padding:4px 0; color:#76856E;">Name</td><td style="padding:4px 0; font-weight:bold;">${homeowner.esc(l.name)}</td></tr>
+          <tr><td style="padding:4px 0; color:#76856E;">Phone</td><td style="padding:4px 0; font-weight:bold;">${homeowner.esc(l.phone)}</td></tr>
+          <tr><td style="padding:4px 0; color:#76856E;">Address</td><td style="padding:4px 0;">${homeowner.esc(l.address) || "—"}</td></tr>
           <tr><td style="padding:4px 0; color:#76856E;">Trees</td><td style="padding:4px 0;">${treeCount}</td></tr>
           <tr><td style="padding:4px 0; color:#76856E;">Services</td><td style="padding:4px 0;">${(l.services || []).join(", ")}</td></tr>
           <tr><td style="padding:4px 0; color:#76856E;">Preliminary range</td><td style="padding:4px 0; font-weight:bold;">${priceLine}</td></tr>
+          ${(homeowner.intakeLines(l.intake ? homeowner.cleanIntake(l.intake) : null)).map(x => `<tr><td colspan="2" style="padding:3px 0; font-size:13.5px;">&bull; ${homeowner.esc(x)}</td></tr>`).join("")}
         </table>
         <p style="font-size:12.5px; color:#76856E; margin-top:18px;">Log into your CanopyBid account for full photos and AI analysis on each tree.</p>
       </div>
     </div>`;
 }
 
-function homeownerConfirmationEmailHtml(l, matched) {
+function homeownerConfirmationEmailHtml(l, matched, statusUrl) {
   const priceLine = l.quote_low ? `$${Number(l.quote_low).toLocaleString()} – $${Number(l.quote_high).toLocaleString()}` : "Pending on-site inspection";
   return `
     <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; color: #14261B;">
@@ -101,13 +128,14 @@ function homeownerConfirmationEmailHtml(l, matched) {
         <span style="color:#F3EFE4; font-size:18px; font-weight:bold;">We've got your request</span>
       </div>
       <div style="border:1px solid #eee; border-top:none; padding:22px 24px; border-radius:0 0 10px 10px;">
-        <p style="font-size:15px; margin:0 0 14px;">Hi ${l.name}, thanks for using CanopyBid. Here's a copy of what you submitted.</p>
+        <p style="font-size:15px; margin:0 0 14px;">Hi ${homeowner.esc(l.name)}, thanks for using CanopyBid. Here's a copy of what you submitted.</p>
         <table style="width:100%; font-size:14px; border-collapse:collapse;">
           <tr><td style="padding:4px 0; color:#76856E;">Address</td><td style="padding:4px 0;">${l.address || "—"}</td></tr>
           <tr><td style="padding:4px 0; color:#76856E;">Services</td><td style="padding:4px 0;">${(l.services || []).join(", ")}</td></tr>
           <tr><td style="padding:4px 0; color:#76856E;">Preliminary range</td><td style="padding:4px 0; font-weight:bold;">${priceLine}</td></tr>
         </table>
         <p style="font-size:13px; margin-top:18px;">${matched ? "A local tree company covering your area has been notified and should reach out soon." : "Our team will review your request and follow up with next steps."} This is a preliminary estimate, not a final price — the company will confirm details on-site.</p>
+    ${statusUrl ? `<p style="font-size:14px; margin-top:16px;"><a href="${statusUrl}" style="color:#14261B; font-weight:bold;">See where your request stands</a><br><span style="font-size:12px; color:#76856E;">This private link shows who has your request and what happens next. Keep it to yourself.</span></p>` : ""}
       </div>
     </div>`;
 }
@@ -144,19 +172,19 @@ app.post("/api/analyze", publicLimiter, async (req, res) => {
     return res.status(500).json({ error: "Server is missing ANTHROPIC_API_KEY. Set it in your .env file." });
   }
 
-  const { images, services } = req.body;
+  const { images, services, hazards } = req.body;
   if (!Array.isArray(images) || images.length === 0) {
     return res.status(400).json({ error: "Send at least one image as { images: [{slot, media_type, data}] }." });
   }
 
   const slotLabels = {
     full: "Full tree, entire height visible",
-    base: "Trunk with the homeowner's palm pressed flat against the bark at chest height, for scale",
     surroundings: "Surrounding area — what is around the tree (house, fences, power lines, driveway, yard)",
     canopy: "Looking up into the canopy",
     house: "Tree in relation to the house",
     access: "Path from the street or driveway to the tree",
-    lines: "Nearby power lines"
+    lines: "Nearby power lines",
+    distance: "The whole tree photographed from a safe distance, with something of known size in the frame (a door, a car, a fence post) for scale. No one is standing next to the trunk"
   };
 
   const systemPrompt = `You analyze homeowner-submitted photos of a tree for a tree-service estimating tool called CanopyBid. Each photo below is preceded by a text label describing what it shows. Respond with ONLY valid JSON, no markdown fences, no other text, matching exactly this shape:
@@ -167,10 +195,11 @@ app.post("/api/analyze", publicLimiter, async (req, res) => {
   "notes": string
 }
 Rules on sizing, which matters most:
-- Look closely at the "Trunk with the homeowner's palm pressed flat against the bark" photo for a hand pressed flat against the bark. A typical adult palm is roughly 3.5-4 inches wide across the base of the fingers. If a hand is visible flat against the trunk, use it to calculate height and DBH from the pixel proportions as precisely as you can, and keep the range reasonably tight (roughly ±10-15%). Set scale_reference_present to true.
-- If the hand looks held out toward the camera rather than flat against the bark (it will look noticeably larger relative to the trunk than a flat palm would), treat the reference as unreliable rather than using it directly.
-- If no hand or other reference is visible against the trunk, DO NOT default to "typical" size for the species. Instead, say so explicitly in "notes", set scale_reference_present to false, and widen both ranges substantially (at least ±40%) to reflect real uncertainty.
-- Never present a confident-looking narrow range when you are actually guessing from species norms rather than measuring the photo.
+- The size photo is always taken from a safe distance with an object of known size in the frame (a standard house door is about 80 inches tall; a car is about 14 to 16 feet long; a fence post is usually about 4 to 6 feet). Use such an object for scale. Do not ask for or assume anyone is standing near the trunk or touching it.
+- Photo angle, lens distortion, distance and the uncertain size of the reference object all add error. The ranges you give must reflect that and should not be narrower than about ±30%. These are cautious guidelines, not a measured or validated accuracy.
+- Widen the ranges further if the reference object is far from the tree, partly hidden, or not clearly a standard size.
+- If no object of known size is visible, DO NOT default to "typical" size for the species. Instead, say so explicitly in "notes", set scale_reference_present to false, and widen both ranges substantially (at least ±40%) to reflect real uncertainty.
+- Never present a confident-looking narrow range when you are actually guessing from species norms rather than measuring the photo. Do not claim any precision or accuracy figure in "notes".
 Other rules:
 - List 2 to 5 conditions.
 - Use "severe" ONLY for these specific conditions, and nothing else: contact with or very close proximity to power lines, the tree leaning onto or already touching a structure, a major trunk crack or split union, visible root plate movement or lifting, a hanging or suspended broken limb, or a large cavity with uncertain internal decay. If a condition isn't clearly one of these, it is not "severe," even if it sounds serious.
@@ -215,6 +244,7 @@ Other rules:
     content.push({ type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } });
   });
   content.push({ type: "text", text: `Requested service(s): ${services || "not specified"}. Analyze the tree shown above.` });
+  if (hazards && typeof hazards === "object") content.push({ type: "text", text: "Homeowner-reported safety answers (treat as self-reported, not verified): " + JSON.stringify(hazards).slice(0, 400) });
 
   console.log(`\n[analyze] Received ${images.length} photo(s): ${images.map(i => i.slot).join(", ")}`);
 
@@ -229,6 +259,16 @@ Other rules:
       console.error("[analyze] Retry also failed:", secondErr);
       return res.status(502).json({ error: "The vision model call failed after a retry.", detail: String(secondErr) });
     }
+  }
+
+  // Never pass an incomplete or implausible analysis to the page. The page shows an error instead of a guess.
+  const rng = (a, max) => Array.isArray(a) && a.length === 2 && a.every(n => typeof n === "number" && Number.isFinite(n) && n > 0 && n <= max) && a[0] <= a[1];
+  const m = parsed && parsed.measurements;
+  if (!(parsed && parsed.species && typeof parsed.species.common_name === "string" && parsed.species.common_name.trim() && m
+      && rng(m.height_range_ft, 250) && rng(m.dbh_range_in, 150) && rng(m.crown_width_range_ft, 200)
+      && Array.isArray(parsed.conditions) && parsed.conditions.every(c => c && typeof c.text === "string" && ["ok", "watch", "severe"].includes(c.severity)))) {
+    console.error("[analyze] Model returned an incomplete or implausible result; not forwarded.");
+    return res.status(502).json({ error: "The analysis was incomplete." });
   }
 
   try {
@@ -280,6 +320,33 @@ app.get("/api/territories", async (req, res) => {
 const readLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many requests. Please wait a few minutes and try again." } });
 
+// ---------------------------------------------------------------------------
+// GET /api/territories/zips
+// Public, read-only: which whole ZIP codes each territory receives, from the live territory_zips table.
+// "zips" auto-route to the territory's owner; "review_zips" are checked by hand and never auto-routed;
+// held ZIPs are not listed (they are not covered). Routing is by ZIP only and is NOT address-verified.
+// Listing a ZIP here never makes a territory purchasable (see "offered" on /api/territories).
+// ---------------------------------------------------------------------------
+app.get("/api/territories/zips", readLimiter, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT t.id, t.display_name, t.name, t.offered, z.zip, z.status, z.boundary_version
+      FROM territory_zips z JOIN territories t ON t.id = z.territory_id
+      WHERE COALESCE(t.retired, 0) = 0 AND z.status IN ('assigned','review')
+      ORDER BY t.id, z.zip`);
+    const by = {};
+    for (const r of rows) {
+      const t = by[r.id] || (by[r.id] = { id: r.id, name: r.display_name || r.name, offered: r.offered === 1, zips: [], review_zips: [] });
+      (r.status === "assigned" ? t.zips : t.review_zips).push(r.zip);
+    }
+    res.json({ routing: "zip_only", address_verified: false, territories: Object.values(by) });
+  } catch (err) {
+    console.error("[territory-zips] Failed:", err);
+    res.status(500).json({ error: "Could not load territory ZIPs." });
+  }
+});
+
+
 app.get("/api/territories/:id/performance", readLimiter, async (req, res) => {
   const id = Number(req.params.id);
   const range = String(req.query.range || "30d");
@@ -328,6 +395,14 @@ app.post("/api/checkout/create", publicLimiter, async (req, res) => {
     return res.status(400).json({ error: "Provide name, email, and at least one territory_id." });
   }
 
+  // Vetting comes first. An approved applicant (private link) or an existing eligible partner (API key) can start paying;
+  // the identity that gets billed and registered is the vetted one, never what the browser typed.
+  const gate = await applications.authorize(req, { email });
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error, code: gate.code, pending: gate.pending, approval_required: true });
+  const who = gate.app ? { name: gate.app.name, email: gate.app.email, phone: gate.app.phone || "" }
+            : gate.company ? { name: gate.company.name, email: gate.company.email, phone: gate.company.phone || "" }
+            : { name, email, phone: phone || "" };
+
   try {
     const { rows: territories } = await pool.query("SELECT * FROM territories WHERE id = ANY($1)", [territory_ids]);
     // Server-side guard: draft (not yet offered) territories can never be purchased, whatever the browser sends.
@@ -350,7 +425,7 @@ app.post("/api/checkout/create", publicLimiter, async (req, res) => {
     // index on checkout_reservations makes this race-proof even when two buyers click at the same instant.
     const holdId = "hold_" + crypto.randomBytes(8).toString("hex");
     // A buyer who abandoned an earlier checkout and tries again must not be blocked by their own old hold: close it first.
-    const { rows: mine } = await pool.query("SELECT DISTINCT session_id FROM checkout_reservations WHERE status = 'pending' AND lower(buyer_email) = lower($1)", [email]);
+    const { rows: mine } = await pool.query("SELECT DISTINCT session_id FROM checkout_reservations WHERE status = 'pending' AND lower(buyer_email) = lower($1)", [who.email]);
     for (const m of mine) {
       if (m.session_id && m.session_id.startsWith("cs_")) { try { await stripe.checkout.sessions.expire(m.session_id); } catch (e) { /* already completed or expired */ } }
       await pool.query("UPDATE checkout_reservations SET status = 'released' WHERE session_id = $1 AND status = 'pending'", [m.session_id]);
@@ -362,7 +437,7 @@ app.post("/api/checkout/create", publicLimiter, async (req, res) => {
       for (const t of available) {
         await client.query(
           "INSERT INTO checkout_reservations (session_id, buyer_email, territory_id, expires_at) VALUES ($1, $2, $3, NOW() + ($4 || ' minutes')::interval)",
-          [holdId, email, t.id, String(CHECKOUT_HOLD_MINUTES)]
+          [holdId, who.email, t.id, String(CHECKOUT_HOLD_MINUTES)]
         );
       }
       await client.query("COMMIT");
@@ -389,12 +464,14 @@ app.post("/api/checkout/create", publicLimiter, async (req, res) => {
       session = await stripe.checkout.sessions.create({
         mode: "subscription",
         line_items,
-        customer_email: email,
+        customer_email: who.email,   // the vetted address, exactly as approved
         expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
         success_url: `${FRONTEND_URL}/canopybid-companies.html?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${FRONTEND_URL}/canopybid-companies.html?canceled=1`,
         metadata: {
-          name, email, phone: phone || "",
+          name: who.name, email: who.email, phone: who.phone,
+          application_id: gate.app ? String(gate.app.id) : "",
+          source_company_id: gate.company ? String(gate.company.id) : "",
           territory_ids: JSON.stringify(available.map(t => t.id))
         }
       });
@@ -429,12 +506,26 @@ app.get("/api/checkout/confirm", async (req, res) => {
     }
 
     const result = await fulfilSession(session);
+    if (result.duplicate_redemption) return res.status(409).json({ error: result.pending_resolution.message, duplicate_redemption: true, pending_resolution: result.pending_resolution });
     res.json(result);
   } catch (err) {
     console.error("[checkout/confirm] Failed:", err);
     res.status(500).json({ error: "Could not confirm payment.", detail: String(err) });
   }
 });
+
+// What to tell a customer who has paid but whose account cannot go live yet. null when everything is fine.
+// Never promises a refund or a reinstatement: it says what happened and that a person is deciding.
+function pendingResolutionFor(c) {
+  if (!c) return null;
+  if (c.account_status !== "active") return { reason: "account_on_hold", message: "We received your payment, but your account is on hold because your approval changed while you were paying. Your territories are not active yet and you will not receive requests. A member of our team will contact you at the email you used, usually within one business day, to either complete your setup or refund you. You do not need to pay again." };
+  if (c.required_docs !== null && c.required_docs !== undefined || c.__approved) {
+    const ds = R.documentStatus(c);
+    const bad = ds.items.filter(i => i.required && i.state !== "verified");
+    if (bad.length) return { reason: "documents_not_current", message: `We received your payment and your account exists, but ${bad.map(i => i.label.toLowerCase()).join(" and ")} must be current and accepted after our review before homeowner requests are sent to you. Upload a new one from your dashboard. Until then new requests wait with our team. You do not need to pay again.` };
+  }
+  return null;
+}
 
 // Turns a PAID checkout session into a company + claimed territories. Safe to call any number of times and from two
 // places at once (the buyer's browser returning AND Stripe's webhook): a per-session advisory lock plus a unique
@@ -448,29 +539,85 @@ async function fulfilSession(session) {
     if (existingRows[0]) {
       const existing = existingRows[0];
       const { rows: territories } = await client.query("SELECT name, metro FROM territories WHERE company_id = $1", [existing.id]);
+      // The payer's page may load after the webhook already did the work. Still tell them which paid-for territory they did not get
+      // (only shortly after payment, so a territory lost later to a takeover is not reported as a failed claim).
+      const paidIds = JSON.parse((session.metadata || {}).territory_ids || "[]").map(Number);
+      const recent = existing.created_at && Date.now() - new Date(existing.created_at).getTime() < 864e5;
+      const { rows: notGot } = paidIds.length && recent ? await client.query("SELECT name, metro FROM territories WHERE id = ANY($1) AND company_id IS DISTINCT FROM $2", [paidIds, existing.id]) : { rows: [] };
+      const pr0 = pendingResolutionFor({ ...existing, __approved: !!Number((session.metadata || {}).application_id) });
+      // No key is shown or emailed here. Access is set up through the one-time link emailed when the account was created (apikeys.js).
       await client.query("COMMIT");
-      return { company_id: existing.id, api_key: existing.api_key, claimed_territories: territories, failed_to_claim: [] };
+      return { company_id: existing.id, setup_link_emailed: !(pr0 && pr0.reason === "account_on_hold"), claimed_territories: territories, failed_to_claim: notGot, pending_resolution: pr0 || undefined };
     }
     const { name, email, phone, territory_ids } = session.metadata || {};
     const ids = JSON.parse(territory_ids || "[]").map(Number);
-    const apiKey = crypto.randomBytes(24).toString("hex");
+    const appId = Number((session.metadata || {}).application_id) || null;
+    const srcCompanyId = Number((session.metadata || {}).source_company_id) || null;
+    // One approval opens one account. If another payment already used this approval, do not create a second company.
+    const redeem = await applications.beginRedeem(client, appId);
+    if (redeem.blocked) {
+      await client.query("UPDATE checkout_reservations SET status = 'released' WHERE session_id = $1", [session.id]);
+      await client.query("COMMIT");
+      console.error(`[fulfil] DUPLICATE REDEMPTION: checkout ${session.id} (${email}) paid, but approval ${appId} already opened an account. MANUAL REFUND NEEDED.`);
+      await logAudit({ actorType: "stripe", actorId: session.id, action: "duplicate_redemption", targetType: "application", targetId: appId, detail: { email } });
+      const dup = await alerts.raiseAndAnnounce({ kind: "payment_duplicate", severity: "high", applicationId: appId, sessionId: session.id, email, dedupe: `payment_duplicate:${session.id}`,
+        title: `PAYMENT NEEDS RESOLUTION: second payment for one approval (${email})`,
+        message: `Checkout ${session.id} was paid, but approval #${appId} had already opened an account. No second account or territory was activated. Refund this payment in Stripe (or void the subscription), then resolve this alert.` });
+      return { duplicate_redemption: true, pending_resolution: { reason: "duplicate_payment", message: "We received a second payment for an approval that was already used to open an account. We did not activate anything new. A member of our team will review it and refund the extra payment, usually within one business day. Your original account is not affected." } };
+    }
+    // The new account has NO dashboard key. It gets a one-time setup link by email (below), the same process every other account uses.
     const ins = await client.query(
-      "INSERT INTO companies (name, email, phone, api_key, stripe_customer_id, stripe_subscription_id, stripe_checkout_session_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-      [name, email, phone || null, apiKey, session.customer, session.subscription, session.id]
+      "INSERT INTO companies (name, email, phone, stripe_customer_id, stripe_subscription_id, stripe_checkout_session_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+      [name, email, phone || null, session.customer, session.subscription, session.id]
     );
     const companyId = ins.rows[0].id;
+    await applications.inherit(client, companyId, { applicationId: appId, sourceCompanyId: srcCompanyId });
+    if (appId) await applications.markUsed(client, appId, companyId);
+    // Approval withdrawn while the buyer was paying: keep the money trail, but the account receives nothing until an admin looks.
+    if (redeem.revoked) {
+      await apiKeys.setStatus(client, companyId, "suspended", "approval withdrawn while paying");
+      console.error(`[fulfil] WARNING: approval ${appId} was withdrawn while checkout ${session.id} was in progress. Company ${companyId} created SUSPENDED. Decide: refund or reinstate.`);
+      await logAudit({ actorType: "stripe", actorId: session.id, action: "paid_after_revocation", targetType: "company", targetId: companyId, detail: { application_id: appId } });
+    }
+    let pending = null;
+    if (redeem.revoked) pending = pendingResolutionFor({ account_status: "suspended" });
+    else if (appId) {
+      const cfull = (await client.query(`SELECT ${ELIG_COLS} FROM companies WHERE id = $1`, [companyId])).rows[0];
+      cfull.__approved = true;
+      pending = pendingResolutionFor(cfull);
+    }
     const claimed = [], failedToClaim = [];
     for (const tId of ids) {
       const r = await client.query("UPDATE territories SET company_id = $1, stripe_subscription_id = $3, current_price = NULL WHERE id = $2 AND company_id IS NULL AND offered = 1 RETURNING id", [companyId, tId, session.subscription || null]);
       (r.rowCount > 0 ? claimed : failedToClaim).push(tId);
     }
     await client.query("UPDATE checkout_reservations SET status = 'completed' WHERE session_id = $1", [session.id]);
+    let setupLink = null;
+    if (!redeem.revoked) setupLink = await apiKeys.issueSetupLink(client, companyId, "setup");
     const { rows: territories } = claimed.length ? await client.query("SELECT name, metro FROM territories WHERE id = ANY($1)", [claimed]) : { rows: [] };
     const { rows: failedNames } = failedToClaim.length ? await client.query("SELECT name, metro FROM territories WHERE id = ANY($1)", [failedToClaim]) : { rows: [] };
     await client.query("COMMIT");
     if (failedNames.length) console.error(`[fulfil] WARNING: company ${companyId} (${email}) paid for territory already claimed: ${failedNames.map(t => t.name).join(", ")}. Manual refund needed for that portion.`);
+    if (failedNames.length) {
+      const names = failedNames.map(t => `${t.metro}: ${t.name}`).join(", ");
+      await alerts.raiseAndAnnounce({ kind: "territory_claim_failed", severity: "high", companyId, sessionId: session.id, email, dedupe: `claim_failed:${session.id}`,
+        title: `REFUND NEEDED: ${email} paid for a territory another company already holds`,
+        message: `Company #${companyId} (${email}) paid in checkout ${session.id} for ${names}, but another company claimed it first, so it was NOT activated. Do these by hand in Stripe: (1) open the subscription from this checkout and remove the line for that territory so it is not billed again; (2) refund the payment for that territory; (3) email the company to say so. Nothing is refunded or removed automatically.` });
+    }
     await logAudit({ actorType: "stripe", actorId: session.id, action: "checkout_fulfilled", targetType: "company", targetId: companyId, detail: { claimed, failedToClaim } });
-    return { company_id: companyId, api_key: apiKey, claimed_territories: territories, failed_to_claim: failedNames };
+    if (setupLink) {
+      try { await sendEmail({ to: email, subject: "Set up your CanopyBid dashboard", html: apiKeys.setupEmail("setup", name, apiKeys.setupUrl(FRONTEND_URL, setupLink.token), setupLink.hours) }); }
+      catch (e) { console.error("[fulfil] setup email failed for company", companyId, e.message); await alerts.raiseAndAnnounce({ kind: "setup_email_failed", severity: "high", companyId, email, dedupe: `setup_email:${companyId}`, title: `Setup email did not send: ${email}`, message: `Company #${companyId} paid but the setup email failed. Use Send a new sign-in link for this company in the admin tools.` }).catch(() => {}); }
+    }
+    if (pending) {
+      const kind = pending.reason === "account_on_hold" ? "payment_after_revocation" : "payment_docs_not_current";
+      await alerts.raiseAndAnnounce({ kind, severity: "high", companyId, applicationId: appId, sessionId: session.id, email, dedupe: `${kind}:${session.id}`,
+        title: `PAYMENT NEEDS RESOLUTION: ${pending.reason === "account_on_hold" ? "paid after approval was withdrawn" : "paid but documents not current"} (${email})`,
+        message: pending.reason === "account_on_hold"
+          ? `Approval #${appId} was withdrawn while checkout ${session.id} was open. The payment went through. The account (company #${companyId}) was created SUSPENDED and receives nothing. Decide: refund in Stripe, or reinstate the approval and re-activate the account.`
+          : `Checkout ${session.id} was paid, but a required document expired or lost verification before payment finished. Company #${companyId} exists and keeps its territories, but receives no new requests until a current document is verified (or refund in Stripe).` });
+    }
+    return { company_id: companyId, setup_link_emailed: !!setupLink, claimed_territories: territories, failed_to_claim: failedNames, pending_resolution: pending || undefined };
   } catch (e) {
     await client.query("ROLLBACK").catch(() => {});
     throw e;
@@ -501,12 +648,20 @@ async function stripeWebhook(req, res) {
         const { rows } = await pool.query("SELECT id, account_status, suspended_by_billing FROM companies WHERE stripe_subscription_id = $1", [obj.id]);
         const c = rows[0];
         if (c) {
-          let next = null, flag = c.suspended_by_billing;
-          if (status === "canceled") { next = "canceled"; flag = 0; }
+          // 'inactive' (lost its last territory) is not a billing event: the subscription ending is expected and the company keeps access to existing requests.
+          let next = null, flag = c.suspended_by_billing, recovered = false;
+          if (status === "canceled") { if (c.account_status !== "inactive") { next = "canceled"; flag = 0; } }
           else if (status === "past_due" || status === "unpaid") { if (c.account_status === "active") { next = "suspended"; flag = 1; } }
-          else if (status === "active" && c.suspended_by_billing === 1) { next = "active"; flag = 0; }
+          else if (status === "active" && c.suspended_by_billing === 1) { recovered = true; }
+          if (recovered) {
+            // Paying again does NOT re-open a suspended account: dashboard access was revoked, and only an admin can reinstate (with fresh credentials).
+            await alerts.raiseAndAnnounce({ kind: "billing_recovered", severity: "medium", companyId: c.id, dedupe: `billing_recovered:${c.id}:${event.id}`,
+              title: `Billing recovered for company #${c.id}: reinstate if appropriate`,
+              message: `Stripe reports the subscription is paid up again, but the account stays suspended and its dashboard access stays revoked. To restore it, use Reinstate in the admin tools: that emails the company a fresh one-time sign-in link.` }).catch(() => {});
+          }
           if (next) {
-            await pool.query("UPDATE companies SET account_status = $1, suspended_by_billing = $2 WHERE id = $3", [next, flag, c.id]);
+            await pool.query("UPDATE companies SET suspended_by_billing = $1 WHERE id = $2", [flag, c.id]);
+            await apiKeys.setStatus(pool, c.id, next, next === "suspended" ? "billing: payment past due" : "subscription canceled");
             await logAudit({ actorType: "stripe", actorId: event.id, action: "account_status_" + next, targetType: "company", targetId: c.id, detail: { subscription_status: status } });
           }
         }
@@ -534,24 +689,34 @@ function resolveLeadZip(l) {
   return zip ? { zip } : { zip: null, reason: "zip_missing" };
 }
 
-// A company receives automatic leads only if its account is active, it is accepting leads, an admin has verified BOTH
-// its license and insurance, and neither has expired.
-function companyEligible(c) {
-  if (!c || c.accepting_leads === 0) return false;
-  if ((c.account_status || "active") !== "active") return false;
-  if (c.license_status !== "verified" || c.insurance_status !== "verified") return false;
-  const now = Date.now();
-  for (const d of [c.license_expiration, c.insurance_expiration]) if (d && new Date(d).getTime() < now) return false;
-  return true;
-}
+// A company receives automatic leads only when every document it is REQUIRED to have (requirements.js) is verified and not
+// expired, its account is active and it is accepting leads. Older companies keep the original rule (license and insurance).
+function companyEligible(c) { return !!c && R.eligibility(c).eligible; }
 
 // ---------------------------------------------------------------------------
 // POST /api/leads
 // Stores an accepted estimate as a lead and, if the territory is claimed,
 // attaches it to that company.
 // ---------------------------------------------------------------------------
+// ---- Demo quote (for prospective tree companies to try the homeowner flow) ----
+// The demo is recognized HERE, not by a browser flag alone. A request that uses the fictional demo name and address (or sets demo:true) is answered with a
+// demo confirmation and then stops: nothing is stored, no territory/company is looked up, no email/text/webhook is sent, no photos are kept, nothing is counted.
+// Demo details mixed with real ones (an edited name or address) are refused, so a demo can never turn into a real request by accident, or the reverse.
+const DEMO_NAME = "canopybid demo", DEMO_ADDR_START = "123 demo tree lane";
+const demoNorm = v => String(v == null ? "" : v).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+function demoCheck(l) {
+  const nameIsDemo = demoNorm(l.name) === DEMO_NAME;
+  const addrIsDemo = demoNorm(l.address).startsWith(DEMO_ADDR_START);
+  const flagged = l.demo === true || l.demo === "true";
+  if (!nameIsDemo && !addrIsDemo && !flagged) return { demo: false };
+  if (nameIsDemo && addrIsDemo) return { demo: true };
+  return { demo: false, error: "Demo details and real details cannot be mixed. To try the demo, use the demo name and address exactly as shown. For a real request, leave the demo flag off and use your own name and address. Nothing was saved or sent." };
+}
+
 app.post("/api/leads", publicLimiter, async (req, res) => {
   const l = req.body;
+  const demoState = demoCheck(l || {});
+  if (demoState.error) return res.status(400).json({ error: demoState.error, demo_mismatch: true });
 
   // Qualified-lead rules: reject incomplete submissions outright rather than
   // silently accepting them. This is deliberately strict per the "qualified
@@ -568,7 +733,23 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
     return res.status(400).json({ error: "This isn't a qualified lead yet — missing: " + missing.join(", ") });
   }
 
+  // Demo: stop here. No insert, routing, duplicate check, email, text, webhook, alert, media record or audit entry.
+  if (demoState.demo) {
+    console.log("[demo] demo quote completed; nothing stored or sent");
+    return res.status(200).json({ demo: true, lead_id: null, resume_token: null, territory_claimed: false, matched_company: null, routing_status: "demo",
+      message: "Demo Mode — This quote was not sent to any tree companies and was not saved." });
+  }
+
+  // Safety and job details (validated, additive). A hazard answer can force inspection server-side.
+  const intake = homeowner.cleanIntake(l.intake);
+  if (intake && homeowner.needsInspection(intake)) l.inspection_required = true;
+  const idemKey = typeof l.idempotency_key === "string" && /^[A-Za-z0-9_-]{16,80}$/.test(l.idempotency_key) ? l.idempotency_key : null;
+  const leadResponse = async (row, status) => {
+    let mc = null; if (row.assigned_company_id) { const c = (await pool.query("SELECT name, email, phone FROM companies WHERE id = $1", [row.assigned_company_id])).rows[0]; if (c) mc = { name: c.name, email: c.email, phone: c.phone }; }
+    return res.status(status).json({ lead_id: row.id, territory_claimed: !!mc, routing_status: row.routing_status, matched_company: mc, resume_token: (status === 200 && Date.now() - new Date(row.created_at).getTime() > 3600e3) ? undefined : row.resume_token, duplicate_submission: status === 200 });
+  };
   try {
+    if (idemKey) { const prior = (await pool.query("SELECT * FROM leads WHERE idempotency_key = $1", [idemKey])).rows[0]; if (prior) return await leadResponse(prior, 200); }
     // ROUTING (ZIP only). The city/territory name sent by the form is never used to pick a territory.
     // A lead is routed automatically only when its ZIP belongs to a CONFIRMED (offered) territory that has an
     // ELIGIBLE company. Everything else is stored as unassigned and goes to the admin manual-review queue.
@@ -576,9 +757,11 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
     let territory = null, routingBasis = "zip", routingStatus = "unassigned", routingReason = zr.reason || null, company = null;
     if (zr.zip) {
       const { rows } = await pool.query(
-        "SELECT t.* FROM territory_zips z JOIN territories t ON t.id = z.territory_id WHERE z.zip = $1", [zr.zip]);
+        "SELECT t.*, z.status AS zip_status FROM territory_zips z JOIN territories t ON t.id = z.territory_id WHERE z.zip = $1", [zr.zip]);
       const t = rows[0];
       if (!t) routingReason = "zip_unassigned";
+      else if (t.zip_status === "held") routingReason = "zip_unassigned";          // not offered: same as a ZIP we do not serve
+      else if (t.zip_status !== "assigned") routingReason = "zip_overlap_review";
       else if (t.offered !== 1) routingReason = "territory_draft";
       else {
         territory = t;
@@ -612,8 +795,8 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
         services, timeframe, insurance, access, species, height, dbh, crown,
         conditions_json, inspection_required, quote_low, quote_high,
         confidence_label, lead_quality, trees_json, owner_confirmed,
-        consent_version, consent_timestamp, consent_ip, duplicate_flag, duplicate_reason, resume_token
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW(),$27,$28,$29,$30)
+        consent_version, consent_timestamp, consent_ip, duplicate_flag, duplicate_reason, resume_token, intake_json, idempotency_key
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,NOW(),$27,$28,$29,$30,$31,$32)
       RETURNING id
     `, [
       l.name, l.phone, l.email || null, l.address || null, zr.zip || (l.zip ? String(l.zip).slice(0, 10) : null), l.state || null, routedMetro,
@@ -623,7 +806,8 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
       JSON.stringify(l.conditions || []), l.inspection_required ? 1 : 0,
       l.quote_low ?? null, l.quote_high ?? null, l.confidence_label || null, l.lead_quality || null,
       JSON.stringify(l.trees || []), 1,
-      consentVersion, req.ip || null, duplicateFlag ? 1 : 0, duplicateReason, resumeToken
+      consentVersion, req.ip || null, duplicateFlag ? 1 : 0, duplicateReason, resumeToken,
+      intake ? JSON.stringify(intake) : null, idemKey
     ]);
     const leadId = insertResult.rows[0].id;
     await pool.query(
@@ -646,6 +830,12 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
         "INSERT INTO lead_status_history (lead_id, status, changed_by, note) VALUES ($1, 'submitted', 'system', $2)",
         [leadId, `Unassigned, needs manual review: ${routingReason}`]
       );
+      const skipped = !!(intake && intake.coverage_check === "skipped");
+      const high = skipped || ["company_ineligible", "no_company", "zip_overlap_review", "zip_conflict", "zip_missing"].includes(routingReason);
+      await alerts.raiseAndAnnounce({ kind: "lead_unassigned", severity: high ? "high" : "normal", leadId, dedupe: `lead_unassigned:${leadId}`,
+        title: `Request #${leadId} is unassigned (${routingReason}${skipped ? ", coverage unconfirmed" : ""})`,
+        message: `A homeowner request in ZIP ${zr.zip || "unknown"} could not be matched to an eligible company${skipped ? " and the homeowner continued after a coverage lookup failure" : ""}. The homeowner was told nothing is promised. Review it in the lead queue.`,
+        detail: { reason: routingReason, coverage_check: skipped ? "skipped" : "confirmed" } });
     }
 
     // Best-effort notifications — sendEmail never throws, so a failed send
@@ -654,14 +844,14 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
       await sendEmail({
         to: matchedCompany.email,
         subject: `New lead: ${l.name} — ${routedName}`,
-        html: companyLeadEmailHtml(l, matchedCompany, routedName)
+        html: companyLeadEmailHtml(l, matchedCompany, routedName, leadId)
       });
     }
     if (l.email) {
       await sendEmail({
         to: l.email,
         subject: "We've got your tree estimate request",
-        html: homeownerConfirmationEmailHtml(l, !!matchedCompany)
+        html: homeownerConfirmationEmailHtml(l, !!matchedCompany, `${FRONTEND_URL}/status.html?t=${resumeToken}`)
       });
     }
 
@@ -673,6 +863,9 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
       resume_token: resumeToken
     });
   } catch (err) {
+    if (err && err.code === "23505" && idemKey) {   // two identical submissions raced: return the one that won
+      try { const prior = (await pool.query("SELECT * FROM leads WHERE idempotency_key = $1", [idemKey])).rows[0]; if (prior) return await leadResponse(prior, 200); } catch (e2) { /* fall through */ }
+    }
     console.error("[leads] Failed:", err);
     res.status(500).json({ error: "Could not save lead." });
   }
@@ -691,21 +884,46 @@ app.get("/api/companies/me", async (req, res) => {
   if (!apiKey) return res.status(401).json({ error: "Missing x-api-key header." });
 
   try {
-    const { rows } = await pool.query(`
-      SELECT id, name, email, phone,
+    const rows = [await apiKeys.findCompany(pool, apiKey, `name, email, phone, api_key_prefix AS key_prefix,
              license_filename, license_status, license_uploaded_at, license_number, license_expiration,
              insurance_filename, insurance_status, insurance_uploaded_at, insurance_carrier, insurance_policy_number, insurance_expiration,
              legal_name, dba, owner_name, business_address, website, years_in_business,
-             equipment_notes, crew_count, weekly_lead_capacity, desired_response_minutes, accepting_leads
-      FROM companies WHERE api_key = $1
-    `, [apiKey]);
+             equipment_notes, crew_count, weekly_lead_capacity, desired_response_minutes, accepting_leads`)];
     const company = rows[0];
     if (!company) return res.status(401).json({ error: "Invalid API key." });
-    res.json(company);
+    const full = (await pool.query(`SELECT ${ELIG_COLS} FROM companies WHERE id = $1`, [company.id])).rows[0];
+    const el = R.eligibility(full);
+    // self-reported (typed by the company) and verified (checked by an admin) stay separate
+    res.json({ ...company, account_status: full.account_status || "active",
+      readiness: { eligible: el.eligible, pending: el.pending, documents: el.items, required: el.required,
+        note: "License number and insurance carrier are self-reported. We review the documents you upload; we do not confirm them with a licensing authority or insurer." },
+      agreement: { required: R.agreementRequired(), current_version: R.AGREEMENT_VERSION, accepted_version: full.agreement_version || null,
+        accepted: !R.agreementRequired() || full.agreement_version === R.AGREEMENT_VERSION, page: "company-agreement.html", draft: true } });
   } catch (err) {
     console.error("[companies/me] Failed:", err);
     res.status(500).json({ error: "Could not load account." });
   }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/companies/accept-agreement
+// A company accepts the current version of the tree-company agreement (DRAFT text, lawyer review pending). Until it has, it is not
+// eligible for real homeowner requests (see requirements.eligibility). Each acceptance is recorded with the version, name, time and IP.
+// ---------------------------------------------------------------------------
+app.post("/api/companies/accept-agreement", publicLimiter, async (req, res) => {
+  try {
+    const company = await authCompany(req);
+    if (!company) return res.status(401).json({ error: "Invalid API key." });
+    const b = req.body || {};
+    const name = String(b.accepted_name || "").trim().slice(0, 120);
+    if (b.accept !== true) return res.status(400).json({ error: "Tick the box to accept the agreement." });
+    if (name.length < 2) return res.status(400).json({ error: "Type your full name to accept." });
+    if (String(b.version || "") !== R.AGREEMENT_VERSION) return res.status(409).json({ error: "The agreement was updated. Reload the page and read the current version.", current_version: R.AGREEMENT_VERSION });
+    await pool.query("UPDATE companies SET agreement_version = $1, agreement_accepted_at = NOW(), agreement_accepted_name = $2 WHERE id = $3", [R.AGREEMENT_VERSION, name, company.id]);
+    await pool.query("INSERT INTO company_agreement_acceptances (company_id, version, accepted_name, accepted_ip) VALUES ($1,$2,$3,$4)", [company.id, R.AGREEMENT_VERSION, name, req.ip || null]);
+    await logAudit({ actorType: "company", actorId: String(company.id), action: "agreement_accepted", targetType: "company", targetId: company.id, detail: { version: R.AGREEMENT_VERSION } });
+    res.json({ accepted: true, version: R.AGREEMENT_VERSION });
+  } catch (err) { console.error("[accept-agreement] Failed:", err); res.status(500).json({ error: "Could not save your acceptance." }); }
 });
 
 // ---------------------------------------------------------------------------
@@ -727,7 +945,7 @@ app.post("/api/companies/upload-document", async (req, res) => {
   }
 
   try {
-    const { rows } = await pool.query("SELECT id FROM companies WHERE api_key = $1", [apiKey]);
+    const rows = [await apiKeys.findCompany(pool, apiKey, "name")];
     const company = rows[0];
     if (!company) return res.status(401).json({ error: "Invalid API key." });
 
@@ -759,12 +977,8 @@ app.get("/api/companies/document", async (req, res) => {
   if (!["license", "insurance"].includes(type)) return res.status(400).json({ error: "Invalid type." });
 
   try {
-    const { rows } = await pool.query(
-      `SELECT ${type}_doc AS data, ${type}_media_type AS media_type, ${type}_filename AS filename
-       FROM companies WHERE api_key = $1`,
-      [apiKey]
-    );
-    const row = rows[0];
+    const row = await apiKeys.findCompany(pool, apiKey, `${type}_doc AS data, ${type}_media_type AS media_type, ${type}_filename AS filename`);
+    if (row) delete row.id;
     if (!row || !row.data) return res.status(404).json({ error: "No document uploaded." });
     res.json(row);
   } catch (err) {
@@ -778,18 +992,17 @@ app.get("/api/companies/leads", async (req, res) => {
   if (!apiKey) return res.status(401).json({ error: "Missing x-api-key header." });
 
   try {
-    const { rows: compRows } = await pool.query("SELECT * FROM companies WHERE api_key = $1", [apiKey]);
-    const company = compRows[0];
+    const company = await apiKeys.findCompany(pool, apiKey, "*");
     if (!company) return res.status(401).json({ error: "Invalid API key." });
 
     const { rows: leads } = await pool.query(`
       SELECT leads.* FROM leads
-      WHERE leads.assigned_company_id = $1
+      WHERE leads.assigned_company_id = $1 AND leads.deleted_at IS NULL
       ORDER BY leads.created_at DESC
     `, [company.id]);
 
     const mc = await media.countsFor(leads.map(l => l.id));
-    leads.forEach(l => { l.media = mc[l.id] || { photos: 0, video: 0 }; });
+    leads.forEach(l => { l.media = mc[l.id] || { photos: 0, video: 0 }; delete l.idempotency_key; });
     res.json({ company: { id: company.id, name: company.name }, leads });
   } catch (err) {
     console.error("[companies/leads] Failed:", err);
@@ -797,12 +1010,196 @@ app.get("/api/companies/leads", async (req, res) => {
   }
 });
 
+// ---- company dashboard keys: rotate (company) / revoke, reissue, migrate (admin). See apikeys.js. ----
+app.post("/api/companies/me/rotate-key", publicLimiter, async (req, res) => {
+  try {
+    const co = await authCompany(req);
+    if (!co) return res.status(401).json({ error: "Invalid API key." });
+    const nk = apiKeys.newKey();
+    await pool.query("UPDATE companies SET api_key = NULL, api_key_hash = $1, api_key_prefix = $2, api_key_created_at = NOW(), api_key_revoked_at = NULL, api_key_revoked_reason = NULL, api_key_last_used_at = NULL, api_key_reveal = NULL, api_key_reveal_expires = NULL WHERE id = $3", [nk.hash, nk.prefix, co.id]);
+    await logAudit({ actorType: "company", actorId: String(co.id), action: "api_key_rotated", targetType: "company", targetId: String(co.id) });
+    res.json({ api_key: nk.key, note: "This is your new key. It is shown only once and your old key no longer works." });
+  } catch (e) { console.error("[rotate-key] Failed:", e); res.status(500).json({ error: "Could not replace the key." }); }
+});
+
+// ---- Admin export for the CanopyBid Business Tracker workbook (CSV opens in Excel; columns match the workbook's tables) ----
+// Admin-only. Includes every live record. Demo quotes are never stored, so they cannot appear; erased requests are excluded.
+// NOT exported, on purpose: dashboard keys or key hashes, setup links, homeowner status-link tokens, uploaded documents, Stripe ids, payment details, IP addresses.
+// Cells that start with = + - @ are prefixed so a spreadsheet can never run them as a formula.
+function csvCell(v) {
+  if (v == null) return "";
+  if (v instanceof Date) v = v.toISOString().slice(0, 10);
+  let t = String(v).replace(/\r?\n/g, " ");
+  if (/^[=+\-@\t]/.test(t)) t = "'" + t;
+  return /[",]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+}
+function sendCsv(res, name, header, rows) {
+  const body = "﻿" + [header, ...rows].map(r => r.map(csvCell).join(",")).join("\r\n") + "\r\n";
+  res.set({ "Content-Type": "text/csv; charset=utf-8", "Content-Disposition": `attachment; filename="${name}"`, "Cache-Control": "no-store" }).send(body);
+}
+const LEAD_EXPORT_HEADER = ["Lead ID", "Date received", "Homeowner name", "Email", "Phone", "Address", "City", "ZIP", "Service requested", "Number of trees", "Estimated quote range", "Assigned tree company", "Lead status", "Source"];
+app.get("/api/admin/export/leads.csv", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { rows } = await pool.query(`SELECT l.id, l.created_at, l.name, l.email, l.phone, l.address, l.metro, l.zip, l.services, l.trees_json, l.quote_low, l.quote_high, l.inspection_required, l.status, c.name AS company
+      FROM leads l LEFT JOIN companies c ON c.id = l.assigned_company_id WHERE l.deleted_at IS NULL ORDER BY l.id`);
+    const out = rows.map(l => {
+      let services = l.services; try { const j = JSON.parse(l.services); if (Array.isArray(j)) services = j.join("; "); } catch (e) { /* plain text */ }
+      let trees = ""; try { const j = JSON.parse(l.trees_json); if (Array.isArray(j)) trees = j.length; } catch (e) { /* unknown */ }
+      const range = l.inspection_required ? "Inspection needed" : (l.quote_low ? `$${l.quote_low} - $${l.quote_high}` : "");
+      return [l.id, l.created_at, l.name, l.email, l.phone, l.address, l.metro, l.zip, services, trees, range, l.company, l.status, "CanopyBid site"];
+    });
+    await logAudit({ actorType: "admin", action: "export_leads", detail: { rows: out.length } });
+    sendCsv(res, "canopybid-leads.csv", LEAD_EXPORT_HEADER, out);
+  } catch (e) { console.error("[export/leads] Failed:", e); res.status(500).json({ error: "Could not export." }); }
+});
+// One word for the required documents: the worst state among them (same words the dashboard uses).
+const DOC_ORDER = ["rejected", "expired", "not_uploaded", "pending_review", "verified"];
+const worstDocState = states => states.length ? DOC_ORDER.find(x => states.includes(x)) || "verified" : "none required";
+const CO_EXPORT_HEADER = ["Company ID", "Company name", "Contact name", "Email", "Phone", "Website", "Service areas / ZIPs", "Application status", "Insurance / document review status", "Territory", "Plan", "Subscription status", "Monthly fee", "Signup date", "Leads received"];
+app.get("/api/admin/export/companies.csv", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const cos = (await pool.query(`SELECT c.id, c.name, c.owner_name, c.email, c.phone, c.website, c.account_status, c.license_status, c.insurance_status, c.license_expiration, c.insurance_expiration, c.required_docs, c.created_at,
+        (SELECT a.status FROM company_applications a WHERE a.company_id = c.id ORDER BY a.id DESC LIMIT 1) AS app_status,
+        (SELECT COUNT(*)::int FROM leads l WHERE l.assigned_company_id = c.id AND l.deleted_at IS NULL) AS leads_received
+      FROM companies c ORDER BY c.id`)).rows;
+    const terr = (await pool.query("SELECT company_id, metro, name, factor, current_price FROM territories WHERE company_id IS NOT NULL ORDER BY id")).rows;
+    const by = {}; terr.forEach(t => { (by[t.company_id] = by[t.company_id] || []).push(t); });
+    const out = cos.map(c => {
+      const ts = by[c.id] || [];
+      const fee = ts.reduce((n, t) => n + (t.current_price != null ? Number(t.current_price) : Number(territoryMonthlyPrice(t.factor))), 0);
+      const docs = worstDocState(R.documentStatus(c).items.filter(i => i.required).map(i => i.state));
+      return ["C-" + c.id, c.name, c.owner_name, c.email, c.phone, c.website, ts.map(t => t.name).join("; "), c.app_status || "approved (no application on file)", docs, ts.map(t => `${t.metro} - ${t.name}`).join("; "), ts.length ? "Territory subscription" : "", c.account_status, fee || "", c.created_at, c.leads_received];
+    });
+    const apps = (await pool.query("SELECT id, name, contact_name, email, phone, market, status, license_status, insurance_status, created_at FROM company_applications WHERE company_id IS NULL ORDER BY id")).rows;
+    apps.forEach(a => out.push(["A-" + a.id, a.name, a.contact_name, a.email, a.phone, "", a.market || "", a.status, worstDocState([a.license_status, a.insurance_status].map(x => x === "pending" ? "pending_review" : (x || "not_uploaded")).filter(x => x !== "not_uploaded").length ? [a.license_status, a.insurance_status].map(x => x === "pending" ? "pending_review" : (x || "not_uploaded")) : ["not_uploaded"]), "", "", "not a customer yet", "", a.created_at, 0]));
+    await logAudit({ actorType: "admin", action: "export_companies", detail: { rows: out.length } });
+    sendCsv(res, "canopybid-tree-companies.csv", CO_EXPORT_HEADER, out);
+  } catch (e) { console.error("[export/companies] Failed:", e); res.status(500).json({ error: "Could not export." }); }
+});
+
+// ---- One-time sign-in / setup links (see apikeys.js). The only way a company gets a dashboard key. ----
+const SETUP_MSG = "If that email belongs to a company that is waiting to finish setting up, a new one-time sign-in link is on its way. It can take a few minutes.";
+// The company opens the emailed link; the page sends the token (kept in the URL fragment, so it is never sent to a server or logged) and receives the dashboard key once.
+app.post("/api/companies/setup/redeem", publicLimiter, async (req, res) => {
+  try {
+    const r = await apiKeys.redeemSetupLink(pool, (req.body || {}).token);
+    if (r.error) {
+      await logAudit({ actorType: "company", action: "setup_link_rejected", targetType: "company", targetId: r.companyId ? String(r.companyId) : null, detail: { reason: r.error } });
+      return res.status(410).json({ error: "This sign-in link has expired or was already used. Request a new one below.", can_request_new_link: true });
+    }
+    await logAudit({ actorType: "company", actorId: String(r.companyId), action: "setup_link_used", targetType: "company", targetId: String(r.companyId), detail: { purpose: r.purpose } });
+    res.json({ api_key: r.key, note: "This is your dashboard key. It is shown once, on this screen only. The sign-in link cannot be used again." });
+  } catch (e) { console.error("[setup/redeem] Failed:", e); res.status(500).json({ error: "Could not complete setup. Please try again." }); }
+});
+// Safe replacement: the answer is always the same, so it cannot be used to find out which emails are customers. The new link goes only to the address on file,
+// only while setup is unfinished (no key was ever created), only for open accounts, and at most one every 5 minutes per company. A newer link cancels older ones.
+app.post("/api/companies/setup/request-link", publicLimiter, async (req, res) => {
+  const email = String((req.body || {}).email || "").trim().toLowerCase().slice(0, 200);
+  try {
+    if (email.includes("@")) {
+      const { rows } = await pool.query(`SELECT id, name, email FROM companies WHERE lower(email) = $1 AND key_established_at IS NULL AND COALESCE(account_status,'active') IN ('active','inactive')
+        AND NOT EXISTS (SELECT 1 FROM setup_links l WHERE l.company_id = companies.id AND l.created_at > NOW() - INTERVAL '5 minutes') ORDER BY id`, [email]);
+      for (const c of rows) {
+        const link = await apiKeys.issueSetupLink(pool, c.id, "replacement");
+        await sendEmail({ to: c.email, subject: "Your new CanopyBid sign-in link", html: apiKeys.setupEmail("replacement", c.name, apiKeys.setupUrl(FRONTEND_URL, link.token), link.hours) });
+        await logAudit({ actorType: "company", action: "setup_link_requested", targetType: "company", targetId: String(c.id) });
+      }
+    }
+  } catch (e) { console.error("[setup/request-link] Failed:", e); }
+  res.json({ message: SETUP_MSG });
+});
+
+app.post("/api/admin/companies/:id/revoke-key", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id); if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid id." });
+  const reason = String((req.body || {}).reason || "").slice(0, 200) || "revoked by admin";
+  const ex = await pool.query("SELECT id FROM companies WHERE id = $1", [id]);
+  if (!ex.rowCount) return res.status(404).json({ error: "Company not found." });
+  await apiKeys.revokeAccess(pool, id, reason);
+  await logAudit({ actorType: "admin", action: "api_key_revoked", targetType: "company", targetId: String(id), detail: { reason } });
+  res.json({ revoked: true, note: "The key and any unused sign-in link stop working immediately. Use send-setup-link to let the company back in." });
+});
+
+// Emails the company a fresh one-time link (lost key, departed employee, expired link). The old key is ended first, so there is never a second working credential.
+app.post("/api/admin/companies/:id/send-setup-link", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id); if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid id." });
+  try {
+    const co = (await pool.query("SELECT id, name, email, account_status FROM companies WHERE id = $1", [id])).rows[0];
+    if (!co) return res.status(404).json({ error: "Company not found." });
+    if (!apiKeys.isOpen(co.account_status)) return res.status(409).json({ error: "This account is " + co.account_status + ". Use Reinstate instead; it issues the link as part of re-opening the account." });
+    await pool.query("UPDATE companies SET api_key = NULL, api_key_hash = NULL, api_key_prefix = NULL, api_key_revoked_at = NOW(), api_key_revoked_reason = 'replaced by a new sign-in link (admin)', api_key_reveal = NULL, api_key_reveal_expires = NULL, key_established_at = NULL WHERE id = $1", [id]);
+    const link = await apiKeys.issueSetupLink(pool, id, "admin");
+    await sendEmail({ to: co.email, subject: "Your new CanopyBid sign-in link", html: apiKeys.setupEmail("admin", co.name, apiKeys.setupUrl(FRONTEND_URL, link.token), link.hours) });
+    await logAudit({ actorType: "admin", action: "setup_link_sent", targetType: "company", targetId: String(id) });
+    res.json({ sent_to: co.email, expires_in_hours: link.hours, note: "The previous key no longer works. The link is only in the email; it is not shown here." });
+  } catch (e) { console.error("[send-setup-link] Failed:", e); res.status(500).json({ error: "Could not send the link." }); }
+});
+
+// The only way back from suspended or canceled. Old credentials stay invalid; the company gets a fresh one-time link.
+app.post("/api/admin/companies/:id/reinstate", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = Number(req.params.id); if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid id." });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const r = await apiKeys.reinstate(client, id);
+    if (r.notFound) { await client.query("ROLLBACK"); return res.status(404).json({ error: "Company not found." }); }
+    if (r.refused) { await client.query("ROLLBACK"); return res.status(409).json({ error: "Only a suspended or canceled account can be reinstated (this one is " + r.from + ")." }); }
+    const co = (await client.query("SELECT name, email FROM companies WHERE id = $1", [id])).rows[0];
+    await client.query("COMMIT");
+    await sendEmail({ to: co.email, subject: "Your CanopyBid account is reinstated: set up new access", html: apiKeys.setupEmail("reinstate", co.name, apiKeys.setupUrl(FRONTEND_URL, r.link.token), r.link.hours) });
+    await logAudit({ actorType: "admin", action: "company_reinstated", targetType: "company", targetId: String(id), detail: { from: r.from, to: r.to } });
+    res.json({ reinstated: true, status: r.to, sent_to: co.email, note: r.to === "inactive" ? "The company holds no territory, so it is Inactive: it can see existing requests but receives no new ones." : "Active again once the company has used the link. Old credentials stay invalid." });
+  } catch (e) { await client.query("ROLLBACK").catch(() => {}); console.error("[reinstate] Failed:", e); res.status(500).json({ error: "Could not reinstate." }); }
+  finally { client.release(); }
+});
+
+// Emergency only. Showing a key to an admin is a second way in, so it is OFF unless ALLOW_ADMIN_KEY_DISPLAY=1. Normal route: send-setup-link.
+app.post("/api/admin/companies/:id/reissue-key", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  if (process.env.ALLOW_ADMIN_KEY_DISPLAY !== "1") return res.status(410).json({ error: "Showing a key to an admin is turned off. Use send-setup-link: it emails the company a one-time link." });
+  const id = Number(req.params.id); if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid id." });
+  const co0 = (await pool.query("SELECT account_status FROM companies WHERE id = $1", [id])).rows[0];
+  if (co0 && !apiKeys.isOpen(co0.account_status)) return res.status(409).json({ error: "This account is " + co0.account_status + ". Use Reinstate." });
+  const nk = apiKeys.newKey();
+  const r = await pool.query("UPDATE companies SET api_key = NULL, api_key_hash = $1, api_key_prefix = $2, api_key_created_at = NOW(), api_key_revoked_at = NULL, api_key_revoked_reason = NULL, api_key_last_used_at = NULL, api_key_reveal = NULL, api_key_reveal_expires = NULL, key_established_at = NOW() WHERE id = $3 RETURNING name, email", [nk.hash, nk.prefix, id]);
+  if (!r.rowCount) return res.status(404).json({ error: "Company not found." });
+  await logAudit({ actorType: "admin", action: "api_key_reissued", targetType: "company", targetId: String(id) });
+  res.json({ company: r.rows[0].name, registered_email: r.rows[0].email, api_key: nk.key, note: "Shown once. The previous key no longer works." });
+});
+
+// Migration of keys stored the old way (plain text). Step 1 (no body): counts. Step 2 {confirm:true}: fill in hashes (keys keep working). Step 3 {confirm:true, blank_plaintext:true}: remove the plain-text copies.
+app.post("/api/admin/keys/migrate", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const b = req.body || {};
+    const count = async () => (await pool.query("SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE api_key_hash IS NOT NULL)::int hashed, COUNT(*) FILTER (WHERE api_key IS NOT NULL AND api_key_hash IS NULL)::int plain_only, COUNT(*) FILTER (WHERE api_key IS NOT NULL)::int plain_stored FROM companies")).rows[0];
+    let out = { before: await count() };
+    if (b.confirm === true) {
+      const todo = (await pool.query("SELECT id, api_key FROM companies WHERE api_key IS NOT NULL AND api_key_hash IS NULL")).rows;
+      for (const c of todo) await pool.query("UPDATE companies SET api_key_hash = $1, api_key_prefix = $2, api_key_created_at = COALESCE(api_key_created_at, NOW()) WHERE id = $3", [apiKeys.hashKey(c.api_key), c.api_key.slice(0, 6), c.id]);
+      out.hashed_now = todo.length;
+      if (b.blank_plaintext === true) {
+        const left = (await pool.query("SELECT COUNT(*)::int n FROM companies WHERE api_key IS NOT NULL AND api_key_hash IS NULL")).rows[0].n;
+        if (left) return res.status(409).json({ error: "Some keys have no hash yet; plain-text keys were NOT removed." });
+        out.plain_text_removed = (await pool.query("UPDATE companies SET api_key = NULL WHERE api_key IS NOT NULL")).rowCount;
+      }
+      await logAudit({ actorType: "admin", action: "api_keys_migrated", detail: { hashed_now: out.hashed_now, blanked: !!b.blank_plaintext } });
+      out.after = await count();
+    }
+    out.next_step = !out.after ? "Send {confirm:true} to fill in the hashes (nothing changes for companies)." : out.after.plain_stored ? "Check that dashboards still work, then send {confirm:true, blank_plaintext:true}. Take a database backup first. After that set ALLOW_LEGACY_API_KEYS=0." : "Done. Set ALLOW_LEGACY_API_KEYS=0.";
+    res.json(out);
+  } catch (e) { console.error("[keys/migrate] Failed:", e); res.status(500).json({ error: "Could not migrate." }); }
+});
+
 // Shared helper: resolve the company behind an x-api-key header.
 async function authCompany(req) {
   const apiKey = req.header("x-api-key");
   if (!apiKey) return null;
-  const { rows } = await pool.query("SELECT * FROM companies WHERE api_key = $1", [apiKey]);
-  return rows[0] || null;
+  return apiKeys.findCompany(pool, apiKey, "*");
 }
 
 // ---------------------------------------------------------------------------
@@ -825,7 +1222,7 @@ app.patch("/api/leads/:id/status", async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT leads.id FROM leads
-      WHERE leads.id = $1 AND leads.assigned_company_id = $2
+      WHERE leads.id = $1 AND leads.assigned_company_id = $2 AND leads.deleted_at IS NULL
     `, [req.params.id, company.id]);
     if (rows.length === 0) return res.status(404).json({ error: "Lead not found for this company." });
 
@@ -849,21 +1246,11 @@ app.patch("/api/leads/:id/status", async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get("/api/leads/resume/:token", async (req, res) => {
   try {
-    const { rows } = await pool.query("SELECT * FROM leads WHERE resume_token = $1", [req.params.token]);
+    const { rows } = await pool.query("SELECT * FROM leads WHERE resume_token = $1 AND deleted_at IS NULL", [req.params.token]);
     const lead = rows[0];
-    if (!lead) return res.status(404).json({ error: "This link isn't valid or has expired." });
-
-    const { rows: history } = await pool.query(
-      "SELECT status, note, created_at FROM lead_status_history WHERE lead_id = $1 ORDER BY created_at ASC",
-      [lead.id]
-    );
-    res.json({
-      name: lead.name, address: lead.address, status: lead.status,
-      quote_low: lead.quote_low, quote_high: lead.quote_high,
-      inspection_required: !!lead.inspection_required,
-      services: JSON.parse(lead.services || "[]"),
-      history
-    });
+    if (!lead) return res.status(404).json({ error: "This link isn't valid." });
+    if (homeowner.linkExpired(lead)) return res.status(410).json({ error: "This link has expired. You can have a new one emailed to you.", expired: true });
+    res.json(await homeowner.statusPayload(lead));
   } catch (err) {
     console.error("[leads/resume] Failed:", err);
     res.status(500).json({ error: "Could not load this request." });
@@ -998,6 +1385,7 @@ app.get("/api/admin/companies", async (req, res) => {
              created_at
       FROM companies ORDER BY created_at DESC
     `);
+    const full = {}; (await pool.query(`SELECT ${ELIG_COLS} FROM companies`)).rows.forEach(r => { full[r.id] = r; });
     const { rows: territories } = await pool.query(`
       SELECT company_id, state, metro, name FROM territories WHERE company_id IS NOT NULL
     `);
@@ -1006,7 +1394,7 @@ app.get("/api/admin/companies", async (req, res) => {
       byCompany[t.company_id] = byCompany[t.company_id] || [];
       byCompany[t.company_id].push(`${t.metro} — ${t.name}`);
     });
-    const result = companies.map(c => ({ ...c, territories: byCompany[c.id] || [] }));
+    const result = companies.map(c => { const el = R.eligibility(full[c.id]); return { ...c, territories: byCompany[c.id] || [], readiness: { eligible: el.eligible, pending: el.pending, documents: el.items, required: el.required } }; });
     res.json(result);
   } catch (err) {
     console.error("[admin/companies] Failed:", err);
@@ -1045,17 +1433,25 @@ app.get("/api/admin/document", async (req, res) => {
 // ---------------------------------------------------------------------------
 app.post("/api/admin/verify", async (req, res) => {
   if (!requireAdmin(req, res)) return;
-  const { company_id, doc_type, status } = req.body;
+  const { company_id, doc_type, status, expiration } = req.body;
   if (!["license", "insurance"].includes(doc_type)) return res.status(400).json({ error: "Invalid doc_type." });
+  if (expiration !== undefined && expiration !== null && expiration !== "" && (isNaN(new Date(expiration)) || new Date(expiration).getTime() < Date.now())) return res.status(400).json({ error: "The expiration date must be a valid date in the future." });
   if (!["verified", "rejected"].includes(status)) return res.status(400).json({ error: "Invalid status." });
   if (!company_id) return res.status(400).json({ error: "Missing company_id." });
 
   try {
     // doc_type is checked against a fixed whitelist above, so it's safe to
     // interpolate into the column name here.
-    await pool.query(`UPDATE companies SET ${doc_type}_status = $1 WHERE id = $2`, [status, company_id]);
+    await pool.query(`UPDATE companies SET ${doc_type}_status = $1, ${doc_type}_verified_at = ${status === "verified" ? "NOW()" : "NULL"}${expiration ? `, ${doc_type}_expiration = $3` : ""} WHERE id = $2`, expiration ? [status, company_id, String(expiration).slice(0, 10)] : [status, company_id]);
     await logAudit({ actorType: "admin", actorId: "admin", action: "verify_document", targetType: "company", targetId: company_id, detail: { doc_type, status } });
     console.log(`[admin/verify] Company ${company_id}'s ${doc_type} marked ${status}.`);
+    if (status === "rejected") {
+      // The company is told what happened; the proposed review window (company terms) also promises this for incomplete submissions.
+      try {
+        const co = (await pool.query("SELECT name, email FROM companies WHERE id = $1", [company_id])).rows[0];
+        if (co && co.email) await sendEmail({ to: co.email, subject: "A document needs another look", html: `<p>Hi ${String(co.name || "").replace(/[<>&]/g, "")},</p><p>We could not accept your ${R.LABELS[doc_type].name.toLowerCase()} as uploaded (for example it is unreadable, expired, incomplete, or does not match your company). Please open your partner dashboard and upload a corrected copy. We will review it as soon as we can. Until a current document is accepted, new requests for your territories are paused and your subscription continues.</p><p>Questions? Reply to this email or write to hello@canopybid.com.</p>` });
+      } catch (e) { console.error("[admin/verify] rejection email failed:", e.message); }
+    }
     res.json({ status });
   } catch (err) {
     console.error("[admin/verify] Failed:", err);
@@ -1074,8 +1470,10 @@ app.get("/api/admin/leads", async (req, res) => {
     const { rows } = await pool.query(`
       SELECT id, name, phone, address, zip, territory_name, territory_id, status, routing_status, routing_reason,
              assigned_company_id, submitted_territory_hint, duplicate_flag,
-             duplicate_reason, admin_reviewed, quote_low, quote_high, inspection_required, created_at
-      FROM leads ${req.query.unassigned === "1" ? "WHERE routing_status = 'unassigned'" : ""}
+             duplicate_reason, admin_reviewed, quote_low, quote_high, inspection_required, created_at,
+             (SELECT COUNT(*)::int FROM lead_reports r WHERE r.lead_id = leads.id AND r.resolved = 0) AS open_reports,
+             (SELECT string_agg(DISTINCT r.kind, ', ') FROM lead_reports r WHERE r.lead_id = leads.id AND r.resolved = 0) AS report_kinds
+      FROM leads WHERE deleted_at IS NULL ${req.query.unassigned === "1" ? "AND routing_status = 'unassigned'" : ""}
       ORDER BY created_at DESC LIMIT 200
     `);
     const mc = await media.countsFor(rows.map(l => l.id));
@@ -1160,16 +1558,78 @@ app.post("/api/leads/:id/dispute", async (req, res) => {
   const { reason, detail } = req.body;
   if (!reason) return res.status(400).json({ error: "Missing reason." });
   try {
-    const { rows: own } = await pool.query("SELECT id FROM leads WHERE id = $1 AND assigned_company_id = $2", [req.params.id, company.id]);
+    const { rows: own } = await pool.query("SELECT id FROM leads WHERE id = $1 AND assigned_company_id = $2 AND deleted_at IS NULL", [req.params.id, company.id]);
     if (!own.length) return res.status(404).json({ error: "Lead not found for this company." });
     await pool.query(
       "INSERT INTO lead_disputes (lead_id, company_id, reason, detail) VALUES ($1, $2, $3, $4)",
       [req.params.id, company.id, reason, detail || null]
     );
     await pool.query("UPDATE leads SET status = 'disputed' WHERE id = $1", [req.params.id]);
+    const rk = ROUTING_ISSUE_REASONS[String(reason).trim().toLowerCase()];
+    if (rk) await logRoutingIssue({ leadId: req.params.id, companyId: company.id, kind: rk, source: "company", note: detail });
     res.status(201).json({ filed: true });
   } catch (err) {
     res.status(500).json({ error: "Could not file dispute." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Misroute tracking. A company dispute whose reason is "misrouted" / "outside_territory" (misrouted) or
+// "boundary_complaint" is also written to routing_issues, and the admin can log one by hand. The monthly report
+// checks the three triggers for adding address checking: 3+ misrouted requests in a month, any company boundary
+// complaint, or a second metro on sale. Routing stays ZIP-only; nothing here changes how a request is routed.
+// ---------------------------------------------------------------------------
+const ROUTING_ISSUE_REASONS = { misrouted: "misrouted", outside_territory: "misrouted", wrong_territory: "misrouted", boundary_complaint: "boundary_complaint" };
+async function logRoutingIssue({ leadId, companyId, kind, source, note }) {
+  try {
+    const { rows } = await pool.query("SELECT zip, territory_id, assigned_company_id FROM leads WHERE id = $1 AND deleted_at IS NULL", [leadId]);
+    if (!rows.length) return null;
+    const l = rows[0];
+    const r = await pool.query(
+      "INSERT INTO routing_issues (lead_id, company_id, zip, territory_id, kind, source, note) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+      [leadId, companyId || l.assigned_company_id || null, l.zip, l.territory_id, kind, source, note ? String(note).slice(0, 1000) : null]);
+    return r.rows[0].id;
+  } catch (err) { console.error("[routing-issue] could not log:", err.message); return null; }
+}
+
+// POST /api/admin/routing-issues  body: { lead_id, kind?: "misrouted"|"boundary_complaint", note? }
+app.post("/api/admin/routing-issues", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const kind = req.body.kind || "misrouted";
+  if (!["misrouted", "boundary_complaint"].includes(kind)) return res.status(400).json({ error: "kind must be misrouted or boundary_complaint." });
+  if (!Number.isInteger(Number(req.body.lead_id))) return res.status(400).json({ error: "lead_id is required." });
+  const id = await logRoutingIssue({ leadId: Number(req.body.lead_id), kind, source: "admin", note: req.body.note });
+  if (!id) return res.status(404).json({ error: "Lead not found." });
+  await logAudit({ actorType: "admin", actorId: "admin", action: "log_routing_issue", targetType: "lead", targetId: String(req.body.lead_id), detail: { kind } });
+  res.status(201).json({ id });
+});
+
+// GET /api/admin/routing-issues?month=YYYY-MM   (default: current month, server time)
+app.get("/api/admin/routing-issues", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(req.query.month || "") ? req.query.month : new Date().toISOString().slice(0, 7);
+    const from = month + "-01";
+    const range = "created_at >= $1::date AND created_at < ($1::date + INTERVAL '1 month')";
+    const issues = (await pool.query(`SELECT r.*, c.name AS company_name FROM routing_issues r LEFT JOIN companies c ON c.id = r.company_id
+      WHERE r.created_at >= $1::date AND r.created_at < ($1::date + INTERVAL '1 month') ORDER BY r.created_at DESC`, [from])).rows;
+    const routed = (await pool.query(`SELECT COUNT(*)::int n FROM leads WHERE assigned_company_id IS NOT NULL AND ${range}`, [from])).rows[0].n;
+    const misrouted = issues.filter(i => i.kind === "misrouted").length;
+    const complaints = issues.filter(i => i.kind === "boundary_complaint").length;
+    const metros = (await pool.query("SELECT COUNT(DISTINCT metro)::int n FROM territories WHERE offered = 1 AND COALESCE(retired,0) = 0")).rows[0].n;
+    res.json({
+      month, routed_requests: routed, misrouted, boundary_complaints: complaints, offered_metros: metros,
+      triggers: {
+        misrouted_3_or_more_in_month: misrouted >= 3,
+        company_boundary_complaint: complaints >= 1,
+        second_metro_offered: metros >= 2,
+      },
+      consider_address_checking: misrouted >= 3 || complaints >= 1 || metros >= 2,
+      issues,
+    });
+  } catch (err) {
+    console.error("[routing-issues] Failed:", err);
+    res.status(500).json({ error: "Could not load routing issues." });
   }
 });
 
@@ -1248,7 +1708,7 @@ app.post("/api/admin/leads/:id/assign", async (req, res) => {
     const t = tr[0];
     if (!t || !t.company_id) return res.status(400).json({ error: "That territory has no company." });
     const { rows: cr } = await pool.query("SELECT * FROM companies WHERE id = $1", [t.company_id]);
-    if (!companyEligible(cr[0])) return res.status(400).json({ error: "That territory's company is not eligible (verified license and insurance, accepting leads)." });
+    if (!companyEligible(cr[0])) return res.status(400).json({ error: "That territory's company is not eligible (license and insurance reviewed and accepted, agreement accepted, accepting leads)." });
     const { rowCount } = await pool.query(
       "UPDATE leads SET territory_id = $1, territory_name = $2, metro = $3, assigned_company_id = $4, routing_status = 'assigned', routing_reason = NULL, routing_basis = 'manual', status = 'assigned' WHERE id = $5 AND routing_status = 'unassigned'",
       [t.id, t.name, t.metro, t.company_id, req.params.id]);
@@ -1267,12 +1727,13 @@ app.post("/api/admin/leads/:id/assign", async (req, res) => {
 app.post("/api/admin/companies/:id/status", async (req, res) => {
   if (!requireAdmin(req, res)) return;
   const status = req.body.status;
-  if (!["active", "suspended", "canceled"].includes(status)) return res.status(400).json({ error: "status must be active, suspended or canceled." });
+  if (!["active", "inactive", "suspended", "canceled"].includes(status)) return res.status(400).json({ error: "status must be active, inactive, suspended or canceled." });
   try {
-    const { rowCount } = await pool.query("UPDATE companies SET account_status = $1 WHERE id = $2", [status, req.params.id]);
-    if (!rowCount) return res.status(404).json({ error: "Company not found." });
-    await logAudit({ actorType: "admin", action: "company_status", targetType: "company", targetId: req.params.id, detail: { status } });
-    res.json({ status });
+    const r = await apiKeys.setStatus(pool, Number(req.params.id), status, "closed by admin");
+    if (r.notFound) return res.status(404).json({ error: "Company not found." });
+    if (r.refused) return res.status(409).json({ error: "A suspended or canceled account can only be re-opened with the Reinstate action, which also issues fresh credentials." });
+    await logAudit({ actorType: "admin", action: "company_status", targetType: "company", targetId: req.params.id, detail: { status, from: r.from, access_revoked: !apiKeys.isOpen(status) } });
+    res.json({ status, access_revoked: !apiKeys.isOpen(status) });
   } catch (err) {
     res.status(500).json({ error: "Could not update company status." });
   }
@@ -1345,7 +1806,7 @@ app.post("/api/admin/territories/release", async (req, res) => {
     const left = await pool.query("SELECT COUNT(*)::int AS n FROM territories WHERE company_id = $1", [companyId]);
     let cancelled = false, stripeNote = null;
     if (left.rows[0].n === 0) {
-      await pool.query("UPDATE companies SET account_status = 'canceled' WHERE id = $1", [companyId]);
+      await apiKeys.setStatus(pool, companyId, "inactive");   // lost its last territory: no new requests, existing requests stay reachable
       const c = await pool.query("SELECT stripe_subscription_id FROM companies WHERE id = $1", [companyId]);
       const sub = c.rows[0] && c.rows[0].stripe_subscription_id;
       if (sub && stripe) { try { await stripe.subscriptions.cancel(sub); cancelled = true; } catch (e) { stripeNote = "Could not cancel the Stripe subscription: " + e.message; } }
@@ -1383,16 +1844,29 @@ app.post("/api/admin/territories/offer", async (req, res) => {
 });
 
 const media = require("./media")({ app, pool, express, authCompany, requireAdmin, limiter: publicLimiter, logAudit });
-const bids = require("./bids")({ app, pool, stripe, sendEmail, requireAdmin, authCompany, limiter: publicLimiter, logAudit, basePrice: territoryMonthlyPrice, FRONTEND_URL });
+const homeowner = require("./homeowner")({ app, pool, limiter: publicLimiter, requireAdmin, R, ELIG_COLS, logAudit, sendEmail, FRONTEND_URL });
+const alerts = require("./alerts")({ app, pool, requireAdmin, limiter: publicLimiter, sendEmail, R, ELIG_COLS, logAudit });
+const retention = require("./retention")({ app, pool, requireAdmin, logAudit, alerts, sendEmail });
+const applications = require("./applications")({ app, pool, requireAdmin, limiter: publicLimiter, logAudit, sendEmail, FRONTEND_URL, authCompany });
+const bids = require("./bids")({ app, pool, stripe, sendEmail, requireAdmin, authCompany, limiter: publicLimiter, logAudit, basePrice: territoryMonthlyPrice, FRONTEND_URL, applications, alerts });
 
 app.get("/", (req, res) => {
   res.json({ status: "CanopyBid backend is running." });
 });
 
 initDb()
+  .then(() => apiKeys.schema(pool))
+  .then(() => homeowner.schema())
+  .then(() => alerts.schema())
+  .then(() => applications.schema())
   .then(() => bids.schema())
   .then(() => media.schema())
+  .then(() => retention.schema())
   .then(() => {
+    alerts.startSweep();
+    retention.start();
+    apiKeys.purgeReveals(pool).catch(() => {});
+    setInterval(() => apiKeys.purgeReveals(pool).catch(() => {}), 3600e3).unref();
     app.listen(PORT, () => {
       console.log(`CanopyBid backend listening on port ${PORT}`);
     });
