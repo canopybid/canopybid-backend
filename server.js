@@ -1053,6 +1053,23 @@ app.get("/api/admin/export/leads.csv", async (req, res) => {
     sendCsv(res, "canopybid-leads.csv", LEAD_EXPORT_HEADER, out);
   } catch (e) { console.error("[export/leads] Failed:", e); res.status(500).json({ error: "Could not export." }); }
 });
+// Waitlist: people who asked to be contacted when a partner company covers their ZIP. Admin only. Nothing here is sent to any company.
+app.get("/api/admin/waitlist", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { rows } = await pool.query("SELECT id, zip, name, email, phone, created_at FROM waitlist ORDER BY created_at DESC, id DESC LIMIT 2000");
+    const byZip = {}; rows.forEach(r => { byZip[r.zip] = (byZip[r.zip] || 0) + 1; });
+    res.json({ total: rows.length, by_zip: Object.entries(byZip).sort((x, y) => y[1] - x[1]).map(([zip, n]) => ({ zip, count: n })), entries: rows });
+  } catch (e) { console.error("[admin/waitlist] Failed:", e); res.status(500).json({ error: "Could not load the waitlist." }); }
+});
+app.get("/api/admin/export/waitlist.csv", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const { rows } = await pool.query("SELECT id, created_at, zip, name, email, phone FROM waitlist ORDER BY id");
+    await logAudit({ actorType: "admin", action: "export_waitlist", detail: { rows: rows.length } });
+    sendCsv(res, "canopybid-waitlist.csv", ["Waitlist ID", "Date joined", "ZIP", "Name", "Email", "Phone"], rows.map(r => [r.id, r.created_at, r.zip, r.name, r.email, r.phone]));
+  } catch (e) { console.error("[export/waitlist] Failed:", e); res.status(500).json({ error: "Could not export." }); }
+});
 // One word for the required documents: the worst state among them (same words the dashboard uses).
 const DOC_ORDER = ["rejected", "expired", "not_uploaded", "pending_review", "verified"];
 const worstDocState = states => states.length ? DOC_ORDER.find(x => states.includes(x)) || "verified" : "none required";
