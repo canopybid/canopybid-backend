@@ -184,7 +184,7 @@ app.post("/api/analyze", publicLimiter, async (req, res) => {
     house: "Tree in relation to the house",
     access: "Path from the street or driveway to the tree",
     lines: "Nearby power lines",
-    distance: "The whole tree photographed from a safe distance, with something of known size in the frame (a door, a car, a fence post) for scale. No one is standing next to the trunk"
+    distance: "Size reference photo: either the person's open hand held flat against the trunk (palm and fingers visible for scale), or, if the tree was not safe to approach, the whole tree from a safe distance with something of known size in the frame (a door, a car, a fence post)"
   };
 
   const systemPrompt = `You analyze homeowner-submitted photos of a tree for a tree-service estimating tool called CanopyBid. Each photo below is preceded by a text label describing what it shows. Respond with ONLY valid JSON, no markdown fences, no other text, matching exactly this shape:
@@ -195,7 +195,7 @@ app.post("/api/analyze", publicLimiter, async (req, res) => {
   "notes": string
 }
 Rules on sizing, which matters most:
-- The size photo is always taken from a safe distance with an object of known size in the frame (a standard house door is about 80 inches tall; a car is about 14 to 16 feet long; a fence post is usually about 4 to 6 feet). Use such an object for scale. Do not ask for or assume anyone is standing near the trunk or touching it.
+- The size photo shows either an open adult hand held flat against the trunk (an adult hand is about 7 to 8 inches long and about 3.5 to 4 inches across the palm; hand size varies, so treat this as a rough scale for trunk diameter only, not for height) or, when the tree was not safe to approach, an object of known size beside it (a standard house door is about 80 inches tall; a car is about 14 to 16 feet long; a fence post is usually about 4 to 6 feet). Use whichever is visible. A hand gives no reliable scale for tree height, so widen the height range accordingly. Never ask the person to approach or touch the tree.
 - Photo angle, lens distortion, distance and the uncertain size of the reference object all add error. The ranges you give must reflect that and should not be narrower than about ±30%. These are cautious guidelines, not a measured or validated accuracy.
 - Widen the ranges further if the reference object is far from the tree, partly hidden, or not clearly a standard size.
 - If no object of known size is visible, DO NOT default to "typical" size for the species. Instead, say so explicitly in "notes", set scale_reference_present to false, and widen both ranges substantially (at least ±40%) to reflect real uncertainty.
