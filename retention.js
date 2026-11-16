@@ -56,6 +56,7 @@ module.exports = function initRetention(d) {
     for (const r of m.rows) { if (r.kind === "video") out.videos++; else out.photos++; out.media_bytes += Number(r.size_bytes) || 0; }
     await client.query("DELETE FROM lead_status_history WHERE lead_id = $1", [id]);
     await client.query("DELETE FROM lead_reports WHERE lead_id = $1", [id]);
+    await client.query("DELETE FROM lidar_lookups WHERE lead_id = $1", [id]);
     await client.query("UPDATE lead_disputes SET detail = NULL WHERE lead_id = $1", [id]);
     await client.query("UPDATE routing_issues SET note = NULL WHERE lead_id = $1", [id]);
     await client.query("UPDATE admin_alerts SET title = kind, message = NULL, detail = NULL, email = NULL WHERE lead_id = $1", [id]);
