@@ -1489,12 +1489,18 @@ app.get("/api/admin/leads", async (req, res) => {
              assigned_company_id, submitted_territory_hint, duplicate_flag,
              duplicate_reason, admin_reviewed, quote_low, quote_high, inspection_required, created_at,
              (SELECT COUNT(*)::int FROM lead_reports r WHERE r.lead_id = leads.id AND r.resolved = 0) AS open_reports,
-             (SELECT string_agg(DISTINCT r.kind, ', ') FROM lead_reports r WHERE r.lead_id = leads.id AND r.resolved = 0) AS report_kinds
+             (SELECT string_agg(DISTINCT r.kind, ', ') FROM lead_reports r WHERE r.lead_id = leads.id AND r.resolved = 0) AS report_kinds,
+             access, trees_json
       FROM leads WHERE deleted_at IS NULL ${req.query.unassigned === "1" ? "AND routing_status = 'unassigned'" : ""}
       ORDER BY created_at DESC LIMIT 200
     `);
     const mc = await media.countsFor(rows.map(l => l.id));
-    rows.forEach(l => { l.media = mc[l.id] || { photos: 0, video: 0 }; });
+    rows.forEach(l => {
+      l.media = mc[l.id] || { photos: 0, video: 0 };
+      // Internal only: how each tree's price range was built (base, territory factor, access adjustment, confidence width).
+      let pb = []; try { const j = JSON.parse(l.trees_json); if (Array.isArray(j)) pb = j.map(t => t && t.price_breakdown).filter(x => x && typeof x === "object"); } catch (e) { /* older lead: no breakdown */ }
+      l.price_breakdown = pb; delete l.trees_json;
+    });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: "Could not load leads." });
