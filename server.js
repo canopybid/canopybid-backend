@@ -167,6 +167,10 @@ function territoryMonthlyPrice(factor) {
 // server, never in the browser. This is the piece the standalone frontend
 // file couldn't do safely on its own.
 // ---------------------------------------------------------------------------
+// The same photos (and same answers) must give the same estimate, so a result is remembered for a few hours.
+// Memory only: it holds the analysis result (species, size ranges, condition notes), never the photos or any contact details.
+const analysisCache = new Map();
+const ANALYSIS_CACHE_MS = 6 * 60 * 60 * 1000, ANALYSIS_CACHE_MAX = 300;
 app.post("/api/analyze", publicLimiter, async (req, res) => {
   if (!ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: "Server is missing ANTHROPIC_API_KEY. Set it in your .env file." });
@@ -208,6 +212,7 @@ Other rules:
 - Use "ok" when no concerns are visible.
 - This is a preliminary photo-based read only, not a certified arborist assessment.`;
 
+  let sendTemperature = true;   // zero randomness so identical photos give identical measurements; dropped only if the API refuses it
   async function callAnthropicOnce() {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -219,6 +224,7 @@ Other rules:
       body: JSON.stringify({
         model: "claude-sonnet-4-6",
         max_tokens: 1000,
+        ...(sendTemperature ? { temperature: 0 } : {}),
         system: systemPrompt,
         messages: [{ role: "user", content }]
       })
@@ -246,13 +252,17 @@ Other rules:
   content.push({ type: "text", text: `Requested service(s): ${services || "not specified"}. Analyze the tree shown above.` });
   if (hazards && typeof hazards === "object") content.push({ type: "text", text: "Homeowner-reported safety answers (treat as self-reported, not verified): " + JSON.stringify(hazards).slice(0, 400) });
 
+  const cacheKey = crypto.createHash("sha256").update(JSON.stringify({ v: 1, s: services || "", h: hazards || null, i: images.slice(0, 7).map(i => [i.slot, i.media_type, i.data]) })).digest("hex");
   console.log(`\n[analyze] Received ${images.length} photo(s): ${images.map(i => i.slot).join(", ")}`);
 
   let parsed;
   try {
-    parsed = await callAnthropicOnce();
+    const cached = analysisCache.get(cacheKey);
+    if (cached && cached.at > Date.now() - ANALYSIS_CACHE_MS) { parsed = cached.result; console.log("[analyze] Same photos as a recent request: reusing that result."); }
+    else parsed = await callAnthropicOnce();
   } catch (firstErr) {
     console.warn("[analyze] First attempt failed, retrying once:", firstErr.message);
+    if (/temperature/i.test(firstErr.message)) sendTemperature = false;
     try {
       parsed = await callAnthropicOnce();
     } catch (secondErr) {
@@ -272,6 +282,8 @@ Other rules:
   }
 
   try {
+    if (analysisCache.size >= ANALYSIS_CACHE_MAX) analysisCache.delete(analysisCache.keys().next().value);
+    analysisCache.set(cacheKey, { at: Date.now(), result: parsed });
     console.log(`[analyze] Result: ${parsed.species.common_name} (${parsed.species.confidence_pct}%), height ${parsed.measurements.height_range_ft}, scale reference present: ${parsed.measurements.scale_reference_present}\n`);
     res.json(parsed);
   } catch (err) {
