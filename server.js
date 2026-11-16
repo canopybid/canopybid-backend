@@ -176,7 +176,7 @@ app.post("/api/analyze", publicLimiter, async (req, res) => {
     return res.status(500).json({ error: "Server is missing ANTHROPIC_API_KEY. Set it in your .env file." });
   }
 
-  const { images, services, hazards } = req.body;
+  const { images, services, hazards, address, zip } = req.body;
   if (!Array.isArray(images) || images.length === 0) {
     return res.status(400).json({ error: "Send at least one image as { images: [{slot, media_type, data}] }." });
   }
@@ -255,6 +255,9 @@ Other rules:
   const cacheKey = crypto.createHash("sha256").update(JSON.stringify({ v: 1, s: services || "", h: hazards || null, i: images.slice(0, 7).map(i => [i.slot, i.media_type, i.data]) })).digest("hex");
   console.log(`\n[analyze] Received ${images.length} photo(s): ${images.map(i => i.slot).join(", ")}`);
 
+  // Aerial (LiDAR) lookup runs alongside the photo analysis. Off unless LIDAR_MODE is log or price; it can never fail or delay the quote past its own timeout.
+  const lidarHandle = LIDAR.enabled() ? LIDAR.start({ address: typeof address === "string" ? address.slice(0, 200) : "", zip: typeof zip === "string" ? zip.slice(0, 10) : "", zipAllowed: lidarRoutes.zipAllowed }) : null;
+
   let parsed;
   try {
     const cached = analysisCache.get(cacheKey);
@@ -285,7 +288,15 @@ Other rules:
     if (analysisCache.size >= ANALYSIS_CACHE_MAX) analysisCache.delete(analysisCache.keys().next().value);
     analysisCache.set(cacheKey, { at: Date.now(), result: parsed });
     console.log(`[analyze] Result: ${parsed.species.common_name} (${parsed.species.confidence_pct}%), height ${parsed.measurements.height_range_ft}, scale reference present: ${parsed.measurements.scale_reference_present}\n`);
-    res.json(parsed);
+    let out = parsed;
+    if (lidarHandle) {
+      try {
+        const hr = parsed.measurements.height_range_ft;
+        const row = await LIDAR.finish(lidarHandle, { h_low: hr[0], h_high: hr[1] });
+        if (row) { await lidarRoutes.persist(row); out = { ...parsed, lookup_ref: row.ref, aerial: row.page }; console.log(`[lidar] ${row.status}${row.use_candidate ? " (usable " + row.height_ft + " ft, " + row.tier_name + ")" : ""} in ${row.elapsed_ms} ms: ${row.reason}`); }
+      } catch (e) { console.warn("[lidar] skipped:", e.message); }
+    }
+    res.json(out);
   } catch (err) {
     console.error("[analyze] Failed:", err);
     res.status(500).json({ error: "Analysis failed.", detail: String(err) });
@@ -822,6 +833,7 @@ app.post("/api/leads", publicLimiter, async (req, res) => {
       intake ? JSON.stringify(intake) : null, idemKey
     ]);
     const leadId = insertResult.rows[0].id;
+    await lidarRoutes.linkToLead(leadId, l.trees);
     await pool.query(
       "UPDATE leads SET routing_basis = $1, routing_status = $2, routing_reason = $3, assigned_company_id = $4, submitted_territory_hint = $5 WHERE id = $6",
       [routingBasis, routingStatus, routingReason, company ? company.id : null, l.territory_name ? String(l.territory_name).slice(0, 80) : null, leadId]
@@ -1881,6 +1893,8 @@ app.post("/api/admin/territories/offer", async (req, res) => {
 const media = require("./media")({ app, pool, express, authCompany, requireAdmin, limiter: publicLimiter, logAudit });
 const homeowner = require("./homeowner")({ app, pool, limiter: publicLimiter, requireAdmin, R, ELIG_COLS, logAudit, sendEmail, FRONTEND_URL });
 const alerts = require("./alerts")({ app, pool, requireAdmin, limiter: publicLimiter, sendEmail, R, ELIG_COLS, logAudit });
+const lidarRoutes = require("./lidar-routes")({ app, pool, requireAdmin, limiter: publicLimiter, express });
+const LIDAR = require("./lidar");
 const retention = require("./retention")({ app, pool, requireAdmin, logAudit, alerts, sendEmail });
 const applications = require("./applications")({ app, pool, requireAdmin, limiter: publicLimiter, logAudit, sendEmail, FRONTEND_URL, authCompany });
 const bids = require("./bids")({ app, pool, stripe, sendEmail, requireAdmin, authCompany, limiter: publicLimiter, logAudit, basePrice: territoryMonthlyPrice, FRONTEND_URL, applications, alerts });
@@ -1896,10 +1910,12 @@ initDb()
   .then(() => applications.schema())
   .then(() => bids.schema())
   .then(() => media.schema())
+  .then(() => lidarRoutes.schema())
   .then(() => retention.schema())
   .then(() => {
     alerts.startSweep();
     retention.start();
+    lidarRoutes.startPurge();
     apiKeys.purgeReveals(pool).catch(() => {});
     setInterval(() => apiKeys.purgeReveals(pool).catch(() => {}), 3600e3).unref();
     app.listen(PORT, () => {
