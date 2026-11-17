@@ -18,6 +18,8 @@ const DEFAULTS = {
   strongRadiusM: 30,        // a "strong" match must be this close (street-interpolated geocodes are not parcel-accurate)
   mergeRatio: 0.85,         // two peaks are one crown when the saddle between them is >= this share of the lower peak
   mergeDistM: 2.5,          // ...or when they are closer than this
+  widthTolFrac: 0.3,        // crown-width tie-break: photo width range widened by this share of its midpoint ...
+  widthTolFt: 6,            // ... plus this many feet (both measurements are rough)
   uncertBaseFt: 1.5,        // height uncertainty = base + perFt * height + perYear * years since acquisition
   uncertPerFt: 0.03,
   uncertPerYearFt: 0.5,     // trees keep growing/being cut after the flight
@@ -133,7 +135,8 @@ function decide({ candidates, photo, acquisitionEnd, now, coverage, opts }) {
   const p = Object.assign({}, DEFAULTS, opts || {});
   const age = yearsSince(acquisitionEnd, now);
   const base = { status: "no_data", use_candidate: false, reason: "", chosen: null, height_ft: null, low_ft: null, high_ft: null, uncertainty_ft: null, tier: null, tier_name: null, photo_tier: null, consistent: 0, age_years: age == null ? null : +age.toFixed(2), all_same_tier: null };
-  const fin = (o) => Object.assign(base, o);
+  let wnote = "";
+  const fin = (o) => Object.assign(base, o, wnote && o.reason ? { reason: o.reason + wnote } : {});
   if (age == null) return fin({ status: "no_data", reason: "acquisition date unknown" });
   if (age > p.maxAgeYears) return fin({ status: "stale", reason: `survey is ${age.toFixed(1)} years old (limit ${p.maxAgeYears})` });
   if (coverage != null && coverage < 0.5) return fin({ status: "no_data", reason: "address is outside or at the edge of the processed LiDAR area" });
@@ -143,7 +146,14 @@ function decide({ candidates, photo, acquisitionEnd, now, coverage, opts }) {
   const lo = photo.h_low - tol, hi = photo.h_high + tol;
   const photoTier = tierOfFt(mid);
   const withU = candidates.map((c) => { const u = heightUncertaintyFt(c.height_ft, age, p); return Object.assign({}, c, { u_ft: +u.toFixed(1), low_ft: +(c.height_ft - u).toFixed(1), high_ft: +(c.height_ft + u).toFixed(1), consistent: c.height_ft >= lo && c.height_ft <= hi }); });
-  const cons = withU.filter((c) => c.consistent);
+  let cons = withU.filter((c) => c.consistent);
+  // Second check when several crowns fit the height: the photo's crown-width estimate vs the crown width measured from above. Both are rough, so the
+  // tolerance is wide, and it is only used to break a tie (if nothing fits the width, or everything does, the height-only set stands).
+  if (cons.length > 1 && photo.w_low > 0 && photo.w_high >= photo.w_low) {
+    const wmid = (photo.w_low + photo.w_high) / 2, wtol = p.widthTolFrac * wmid + p.widthTolFt, wlo = photo.w_low - wtol, whi = photo.w_high + wtol;
+    const wc = cons.filter((c) => { const w = c.crown_diam_m * M_TO_FT; return w >= wlo && w <= whi; });
+    if (wc.length && wc.length < cons.length) { wnote = ` [crown width ${photo.w_low}-${photo.w_high} ft narrowed ${cons.length} height matches to ${wc.length}]`; cons = wc; base.width_narrowed = true; }
+  }
   base.photo_tier = photoTier; base.consistent = cons.length;
   const describe = (c) => { const t0 = tierOfFt(c.low_ft), t1 = tierOfFt(c.high_ft); return { chosen: c, height_ft: c.height_ft, low_ft: c.low_ft, high_ft: c.high_ft, uncertainty_ft: c.u_ft, tier: t0 === t1 ? t0 : tierOfFt(c.height_ft), tier_name: TIER_NAMES[t0 === t1 ? t0 : tierOfFt(c.height_ft)], single_tier: t0 === t1 }; };
   if (!cons.length) return fin({ status: "disagrees", reason: `${withU.length} crown(s) nearby but none within ${lo.toFixed(0)}–${hi.toFixed(0)} ft (photo range ±tolerance); tallest ${Math.max(...withU.map((c) => c.height_ft)).toFixed(0)} ft` });

@@ -292,7 +292,8 @@ Other rules:
     if (lidarHandle) {
       try {
         const hr = parsed.measurements.height_range_ft;
-        const row = await LIDAR.finish(lidarHandle, { h_low: hr[0], h_high: hr[1] });
+        const cw = parsed.measurements.crown_width_range_ft || [];
+        const row = await LIDAR.finish(lidarHandle, { h_low: hr[0], h_high: hr[1], w_low: cw[0], w_high: cw[1] });
         if (row) { await lidarRoutes.persist(row); out = { ...parsed, lookup_ref: row.ref, aerial: row.page }; console.log(`[lidar] ${row.status}${row.use_candidate ? " (usable " + row.height_ft + " ft, " + row.tier_name + ")" : ""} in ${row.elapsed_ms} ms: ${row.reason}`); }
       } catch (e) { console.warn("[lidar] skipped:", e.message); }
     }
