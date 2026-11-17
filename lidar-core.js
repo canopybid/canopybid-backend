@@ -161,7 +161,7 @@ function decide({ candidates, photo, acquisitionEnd, now, coverage, opts }) {
   if (near.length > 1 && near[1].dist_m - near[0].dist_m < p.ambiguityGapM) {
     const tiers = near.map((c) => (tierOfFt(c.low_ft) === tierOfFt(c.high_ft) ? tierOfFt(c.low_ft) : -1));
     const same = tiers[0] !== -1 && tiers.every((t) => t === tiers[0]);
-    return fin(Object.assign(describe(near[0]), { status: "multiple", all_same_tier: same, reason: `${near.length} plausible crowns (${near.map((c) => c.height_ft.toFixed(0) + " ft @ " + c.dist_m + " m").join(", ")}); cannot tell which one is the photographed tree` }));
+    return fin(Object.assign(describe(near[0]), { status: "multiple", all_same_tier: same, reason: `${near.length} plausible crowns (${near.map((c) => c.height_ft.toFixed(0) + " ft @ " + c.dist_m + " m, crown " + (c.crown_diam_m * M_TO_FT).toFixed(0) + " ft wide").join("; ")}); cannot tell which one is the photographed tree` + (photo.w_low > 0 ? ` (photo crown width ${photo.w_low}-${photo.w_high} ft)` : " (photo gave no crown width)") }));
   }
   const c = cons[0], d = describe(c), nearestAny = withU[0];
   if (nearestAny !== c && nearestAny.height_ft >= p.minTreeM * M_TO_FT) {
