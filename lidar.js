@@ -85,6 +85,7 @@ async function readGrid(cfg, man, cx, cy, radiusM) {
 
 // ---------- geocoding (server side; the browser never sends coordinates, only the address CanopyBid already collects) ----------
 const geoCache = new Map();
+let lastGeoNote = "";
 async function geocode(cfg, address, zip, signal) {
   const addr = String(address || "").trim(); if (!addr) return null;
   const key = (addr + "|" + (zip || "")).toLowerCase();
@@ -94,14 +95,27 @@ async function geocode(cfg, address, zip, signal) {
     const map = cfg.fixture ? JSON.parse(await fs.promises.readFile(cfg.fixture, "utf8")) : {};
     const hit2 = map[addr.toLowerCase()]; if (hit2) value = { lon: hit2[0], lat: hit2[1], method: "fixture", matched: addr };
   } else {
-    const q = /\b\d{5}\b/.test(addr) || !zip ? addr : addr + " " + zip;
-    const url = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?benchmark=Public_AR_Current&format=json&address=" + encodeURIComponent(q);
-    const r = await fetch(url, { signal }); if (!r.ok) throw new Error("geocoder HTTP " + r.status);
-    const j = await r.json(), m = j && j.result && j.result.addressMatches && j.result.addressMatches[0];
-    if (m && m.coordinates) value = { lon: m.coordinates.x, lat: m.coordinates.y, method: "census_address_range", matched: m.matchedAddress };
+    // The form takes one line ("123 Main St, City, TN 37209") but people also type just the street. The Census service is fussy, so try the
+    // one-line form, then street + ZIP, then one-line with the city/state added. First match wins. Only "no match from any attempt" counts as geocode_failed.
+    const zipIn = (addr.match(/\b(\d{5})(?:-\d{4})?\b/) || [])[1] || String(zip || "").slice(0, 5);
+    const street = addr.split(",")[0].trim(), hasState = /\b(TN|Tennessee)\b/i.test(addr);
+    const base = "https://geocoding.geo.census.gov/geocoder/locations/";
+    const common = "benchmark=Public_AR_Current&format=json&";
+    const attempts = [
+      ["oneline", base + "onelineaddress?" + common + "address=" + encodeURIComponent(/\b\d{5}\b/.test(addr) || !zip ? addr : addr + " " + zip)],
+      zipIn ? ["street+zip", base + "address?" + common + "street=" + encodeURIComponent(street) + "&zip=" + zipIn] : null,
+      !hasState ? ["oneline+TN", base + "onelineaddress?" + common + "address=" + encodeURIComponent(street + ", Nashville, TN " + zipIn)] : null,
+    ].filter(Boolean);
+    const tried = [];
+    for (const [name, url] of attempts) {
+      const r = await fetch(url, { signal }); if (!r.ok) throw new Error("geocoder HTTP " + r.status + " (" + name + ")");
+      const j = await r.json(), m = j && j.result && j.result.addressMatches && j.result.addressMatches[0]; tried.push(name);
+      if (m && m.coordinates) { value = { lon: m.coordinates.x, lat: m.coordinates.y, method: "census_" + name, matched: m.matchedAddress }; break; }
+    }
+    if (!value) lastGeoNote = `no Census match (tried ${tried.join(", ")}); address had ${addr.length} chars, ${addr.split(",").length} comma part(s), ZIP ${zipIn ? "present" : "missing"}`;
   }
   if (geoCache.size > 2000) geoCache.delete(geoCache.keys().next().value);
-  geoCache.set(key, { at: Date.now(), value });
+  if (value) geoCache.set(key, { at: Date.now(), value });   // failures are not remembered: the service is sometimes flaky
   return value;
 }
 
@@ -122,7 +136,7 @@ function start({ address, zip, zipAllowed }) {
     try {
       out.man = await loadManifest(cfg);
       const geo = await geocode(cfg, address, zip, ac.signal);
-      if (!geo) { out.status = "geocode_failed"; out.reason = "address could not be geocoded"; return out; }
+      if (!geo) { out.status = "geocode_failed"; out.reason = "address could not be geocoded" + (lastGeoNote ? ": " + lastGeoNote : ""); return out; }
       out.geo = geo;
       const { proj4: P } = libs(); const [cx, cy] = P("EPSG:4326", "EPSG:26916", [geo.lon, geo.lat]);
       out.cx = cx; out.cy = cy;
