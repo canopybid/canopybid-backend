@@ -18,8 +18,8 @@ const DEFAULTS = {
   strongRadiusM: 30,        // a "strong" match must be this close (street-interpolated geocodes are not parcel-accurate)
   mergeRatio: 0.85,         // two peaks are one crown when the saddle between them is >= this share of the lower peak
   mergeDistM: 2.5,          // ...or when they are closer than this
-  widthTolFrac: 0.3,        // crown-width tie-break: photo width range widened by this share of its midpoint ...
-  widthTolFt: 6,            // ... plus this many feet (both measurements are rough)
+  widthTolFrac: 0.15,        // crown-width tie-break: photo width range widened by this share of its midpoint ...
+  widthTolFt: 3,            // ... plus this many feet (both measurements are rough)
   uncertBaseFt: 1.5,        // height uncertainty = base + perFt * height + perYear * years since acquisition
   uncertPerFt: 0.03,
   uncertPerYearFt: 0.5,     // trees keep growing/being cut after the flight
@@ -161,6 +161,7 @@ function decide({ candidates, photo, acquisitionEnd, now, coverage, opts }) {
   if (near.length > 1 && near[1].dist_m - near[0].dist_m < p.ambiguityGapM) {
     const tiers = near.map((c) => (tierOfFt(c.low_ft) === tierOfFt(c.high_ft) ? tierOfFt(c.low_ft) : -1));
     const same = tiers[0] !== -1 && tiers.every((t) => t === tiers[0]);
+    if (same) return fin(Object.assign(describe(near[0]), { status: "multiple", use_candidate: true, all_same_tier: true, reason: `${near.length} plausible crowns (${near.map((c) => c.height_ft.toFixed(0) + " ft @ " + c.dist_m + " m, crown " + (c.crown_diam_m * M_TO_FT).toFixed(0) + " ft wide").join("; ")}); cannot tell which is the photographed tree, but every one is in the ${TIER_NAMES[tiers[0]]} tier, so the tier does not depend on which it is` }));
     return fin(Object.assign(describe(near[0]), { status: "multiple", all_same_tier: same, reason: `${near.length} plausible crowns (${near.map((c) => c.height_ft.toFixed(0) + " ft @ " + c.dist_m + " m, crown " + (c.crown_diam_m * M_TO_FT).toFixed(0) + " ft wide").join("; ")}); cannot tell which one is the photographed tree` + (photo.w_low > 0 ? ` (photo crown width ${photo.w_low}-${photo.w_high} ft)` : " (photo gave no crown width)") }));
   }
   const c = cons[0], d = describe(c), nearestAny = withU[0];
