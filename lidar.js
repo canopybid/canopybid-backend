@@ -10,7 +10,7 @@
  *   LIDAR_CHM_URL  https base URL of the same files (S3/R2/any static host that supports HTTP range requests)
  *   LIDAR_TIMEOUT_MS      total budget for geocode + tile read + decision (default 2500). Slow = fall back to the photo estimate.
  *   LIDAR_MAX_AGE_YEARS   survey older than this is "stale" and never used (default 6)
- *   LIDAR_GEOCODER        census (default) | fixture   (fixture reads LIDAR_FIXTURE_GEOCODES, a JSON {"address lowercased": [lon,lat]}; tests only)
+ *   LIDAR_GEOCODER        census (default) | parcel (Metro Nashville parcel outline first, Census as the fallback) | fixture   (fixture reads LIDAR_FIXTURE_GEOCODES, a JSON {"address lowercased": [lon,lat]}; tests only)
  *   LIDAR_METRO           metro name the lookup is allowed for (default Nashville); the request ZIP must belong to a territory of it
  */
 const fs = require("fs");
@@ -29,7 +29,7 @@ function config() {
   const e = process.env, mode = ["off", "log", "price"].includes((e.LIDAR_MODE || "").toLowerCase()) ? e.LIDAR_MODE.toLowerCase() : "off";
   return {
     mode, dir: e.LIDAR_CHM_DIR || "", url: (e.LIDAR_CHM_URL || "").replace(/\/+$/, ""), timeoutMs: Math.max(200, parseInt(e.LIDAR_TIMEOUT_MS || "2500", 10) || 2500),
-    maxAgeYears: parseFloat(e.LIDAR_MAX_AGE_YEARS || "6") || 6, geocoder: (e.LIDAR_GEOCODER || "census").toLowerCase(), fixture: e.LIDAR_FIXTURE_GEOCODES || "",
+    maxAgeYears: parseFloat(e.LIDAR_MAX_AGE_YEARS || "6") || 6, geocoder: (e.LIDAR_GEOCODER || "census").toLowerCase(), parcelUrl: e.LIDAR_PARCEL_URL || "", fixture: e.LIDAR_FIXTURE_GEOCODES || "",
     metro: e.LIDAR_METRO || "Nashville",
   };
 }
@@ -85,13 +85,42 @@ async function readGrid(cfg, man, cx, cy, radiusM) {
 
 // ---------- geocoding (server side; the browser never sends coordinates, only the address CanopyBid already collects) ----------
 const geoCache = new Map();
+// ---- Metro Nashville parcel lookup (public ArcGIS layer). Gives the lot's outline, so the tree search is limited to the customer's own lot.
+const SUFFIX = { AVENUE: "AVE", STREET: "ST", DRIVE: "DR", ROAD: "RD", BOULEVARD: "BLVD", LANE: "LN", COURT: "CT", CIRCLE: "CIR", PLACE: "PL", PARKWAY: "PKWY", HIGHWAY: "HWY", TERRACE: "TER", NORTH: "N", SOUTH: "S", EAST: "E", WEST: "W" };
+function parseStreet(addr) {
+  const first = String(addr || "").split(",")[0].toUpperCase().replace(/[^A-Z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const m = first.match(/^(\d{1,6})\s+(.+)$/); if (!m) return null;     // "1318 4th Ave N"
+  const toks = m[2].split(" ").map((w) => SUFFIX[w] || w).filter(Boolean); if (!toks.length) return null;
+  return { house: m[1], pattern: toks.join("%") + "%" };
+}
+async function parcelLookup(cfg, address, zip, signal) {
+  const ps = parseStreet(address); if (!ps) return null;
+  const zipIn = (String(address).match(/\b(\d{5})(?:-\d{4})?\b/) || [])[1] || String(zip || "").slice(0, 5);
+  const base = cfg.parcelUrl || "https://services2.arcgis.com/HdTo6HJqh92wn4D8/ArcGIS/rest/services/Parcels_view/FeatureServer/0/query";
+  const run = async (withZip) => {
+    const where = `PropHouse='${ps.house}' AND UPPER(PropStreet) LIKE '${ps.pattern}'` + (withZip && /^\d{5}$/.test(zipIn) ? ` AND PropZip LIKE '${zipIn}%'` : "");
+    const url = base + "?where=" + encodeURIComponent(where) + "&outFields=PropAddr,Acres,Lat,Lon&returnGeometry=true&outSR=4326&resultRecordCount=12&f=json";
+    const r = await fetch(url, { signal }); if (!r.ok) throw new Error("parcel service HTTP " + r.status);
+    const j = await r.json(); return (j && j.features) || [];
+  };
+  let feats = await run(true); if (!feats.length) feats = await run(false);
+  feats = feats.filter((f) => f.geometry && f.geometry.rings && f.geometry.rings.length);
+  if (!feats.length) return null;
+  const rings = feats.flatMap((f) => f.geometry.rings), pts = rings.flat();
+  const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+  const lon = (Math.min(...xs) + Math.max(...xs)) / 2, lat = (Math.min(...ys) + Math.max(...ys)) / 2;
+  if ((Math.max(...xs) - Math.min(...xs)) * 90000 > 120 || (Math.max(...ys) - Math.min(...ys)) * 111000 > 120) return null;   // not one ordinary lot (large complex): do not trust it
+  return { lon, lat, method: "parcel", matched: feats[0].attributes && feats[0].attributes.PropAddr || "", rings, parcels: feats.length };
+}
 let lastGeoNote = "";
 async function geocode(cfg, address, zip, signal) {
   const addr = String(address || "").trim(); if (!addr) return null;
   const key = (addr + "|" + (zip || "")).toLowerCase();
   const hit = geoCache.get(key); if (hit && hit.at > Date.now() - 24 * 3600e3) return hit.value;
   let value = null;
-  if (cfg.geocoder === "fixture") {
+  if (cfg.geocoder === "parcel") { try { value = await parcelLookup(cfg, addr, zip, signal); } catch (e) { if (signal && signal.aborted) throw e; lastGeoNote = "parcel lookup failed: " + String(e && e.message || e).slice(0, 80); } }
+  if (value) { /* parcel match: done */ }
+  else if (cfg.geocoder === "fixture") {
     const map = cfg.fixture ? JSON.parse(await fs.promises.readFile(cfg.fixture, "utf8")) : {};
     const hit2 = map[addr.toLowerCase()]; if (hit2) value = { lon: hit2[0], lat: hit2[1], method: "fixture", matched: addr };
   } else {
@@ -140,6 +169,7 @@ function start({ address, zip, zipAllowed }) {
       out.geo = geo;
       const { proj4: P } = libs(); const [cx, cy] = P("EPSG:4326", "EPSG:26916", [geo.lon, geo.lat]);
       out.cx = cx; out.cy = cy;
+      if (geo.rings) out.rings = geo.rings.map((ring) => ring.map((p) => P("EPSG:4326", "EPSG:26916", p)));
       const bb = out.man.bbox_lonlat;
       if (bb && (geo.lon < bb[0] || geo.lon > bb[2] || geo.lat < bb[1] || geo.lat > bb[3])) { out.status = "no_data"; out.reason = "geocoded point is outside the prepared LiDAR area"; return out; }
       out.grid = await readGrid(cfg, out.man, cx, cy, core.DEFAULTS.searchRadiusM + 20);
@@ -166,12 +196,16 @@ async function finish(handle, photo, opts = {}) {
     tier: null, tier_name: null, photo_tier: null, candidates: [], elapsed_ms: Date.now() - handle.t0,
   };
   if (!pre.status && pre.grid) {
-    const cands = core.findCandidates(pre.grid, pre.cx, pre.cy);
+    let cands = core.findCandidates(pre.grid, pre.cx, pre.cy), parcelNote = "";
+    if (pre.rings) {                       // limit to the customer's own lot (plus a 4 m edge); if nothing is on the lot, keep the wider search
+      const onLot = core.filterToParcel(cands, pre.rings, 4);
+      if (onLot.length) { parcelNote = ` [lot-limited: ${onLot.length} of ${cands.length} crowns]`; cands = onLot; } else parcelNote = " [no crown on the lot; searched nearby]";
+    }
     const coverage = core.coverageFraction(pre.grid, pre.cx, pre.cy, 30);
     const d = core.decide({ candidates: cands, photo, acquisitionEnd: src.acquisition_end, now: opts.now, coverage, opts: { maxAgeYears: cfg.maxAgeYears } });
     row.candidates = cands.slice(0, 6).map((c) => ({ height_ft: c.height_ft, dist_m: c.dist_m, crown_diam_m: c.crown_diam_m }));
     Object.assign(row, { status: d.status, reason: d.reason, use_candidate: !!d.use_candidate, height_ft: d.height_ft, low_ft: d.low_ft, high_ft: d.high_ft, uncertainty_ft: d.uncertainty_ft, tier: d.tier, tier_name: d.tier_name, photo_tier: d.photo_tier });
-    row.age_years = d.age_years;
+    row.age_years = d.age_years; if (parcelNote) row.reason += parcelNote;
   }
   row.elapsed_ms = Date.now() - handle.t0;
   // What the page is told. Never includes coordinates or the address.
@@ -188,4 +222,4 @@ async function status() {
   return out;
 }
 const _reset = () => { manifestCache = { key: "", at: 0, value: null }; tileHandles.clear(); geoCache.clear(); };
-module.exports = { config, enabled, start, finish, status, _reset };
+module.exports = { config, enabled, start, finish, status, _reset, parseStreet, parcelLookup };

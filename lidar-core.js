@@ -162,6 +162,31 @@ function decide({ candidates, photo, acquisitionEnd, now, coverage, opts }) {
   return fin(Object.assign(d, { status: "strong", use_candidate: true, reason: `single matching crown ${c.height_ft.toFixed(0)} ft ±${c.u_ft} (${c.low_ft.toFixed(0)}–${c.high_ft.toFixed(0)} ft) inside the ${d.tier_name} tier, ${c.dist_m} m from the address` }));
 }
 
+
+/* ---- parcel helpers: rings are arrays of [x, y] in the same metric CRS as the crowns ---- */
+function pointInRings(x, y, rings) {
+  let inside = false;
+  for (const ring of rings) for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+function distToRings(x, y, rings) {
+  let best = Infinity;
+  for (const ring of rings) for (let i = 1; i < ring.length; i++) {
+    const [ax, ay] = ring[i - 1], [bx, by] = ring[i], dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+    const t = L ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L)) : 0;
+    best = Math.min(best, Math.hypot(x - (ax + t * dx), y - (ay + t * dy)));
+  }
+  return best;
+}
+/* Crowns whose top is on the parcel or within bufferM of its edge (a trunk just over the line is still "next to" the lot). */
+function filterToParcel(cands, rings, bufferM = 4) {
+  if (!rings || !rings.length) return cands;
+  return cands.filter((c) => pointInRings(c.x, c.y, rings) || distToRings(c.x, c.y, rings) <= bufferM);
+}
+
 /* ---- pricing helpers: mirror the site's rules so server tests and the admin report can show what the aerial height would do ---- */
 const NASHVILLE_REMOVAL = [[400, 750], [750, 1500], [1400, 3000], [2750, 5500], [5000, 10000]];
 const dbhBucket = (d) => (d < 12 ? 0 : d < 24 ? 1 : d < 36 ? 2 : d < 48 ? 3 : 4);
@@ -177,4 +202,4 @@ function narrowedWidth(confWidth, photoLow, photoHigh, floor = 0.15) {
   return Math.max(floor, Math.sqrt(Math.max(0, confWidth * confWidth - hs * hs)));
 }
 
-module.exports = { DEFAULTS, TIER_EDGES_FT, TIER_NAMES, M_TO_FT, tierOfFt, tierBounds, yearsSince, heightUncertaintyFt, smooth3, findCandidates, coverageFraction, decide, dbhBucket, categoryIdx, quote, narrowedWidth, NASHVILLE_REMOVAL };
+module.exports = { pointInRings, distToRings, filterToParcel, DEFAULTS, TIER_EDGES_FT, TIER_NAMES, M_TO_FT, tierOfFt, tierBounds, yearsSince, heightUncertaintyFt, smooth3, findCandidates, coverageFraction, decide, dbhBucket, categoryIdx, quote, narrowedWidth, NASHVILLE_REMOVAL };
