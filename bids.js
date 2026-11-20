@@ -179,8 +179,8 @@ module.exports = function initBids(d) {
     } catch (e) { await client.query("ROLLBACK").catch(() => {}); throw e; }
     finally { client.release(); }
     await logAudit({ actorType: "system", action: "bid_active", targetType: "territory", targetId: bid.territory_id, detail: { bid_id: bid.id, amount: bid.amount, first } });
-    if (owner) await sendEmail({ to: owner.email, subject: `A company bid ${money(bid.amount)} for your ${label(t)} territory`,
-      html: `<p>Another company has bid <strong>${money(bid.amount)}</strong> for <strong>${label(t)}</strong>. You currently pay ${money(priceOf(t))}.</p>
+    if (owner) await sendEmail({ to: owner.email, subject: `${String(bid.bidder_name).replace(/[\r\n]/g, " ")} bid ${money(bid.amount)} for your ${label(t)} territory`,
+      html: `<p><strong>${String(bid.bidder_name).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]))}</strong> has bid <strong>${money(bid.amount)}</strong> for <strong>${label(t)}</strong>. You currently pay ${money(priceOf(t))}.</p>
 <p><strong>To keep the territory you must match ${money(bid.amount)}, the highest bid so far. Your decision is due by ${when(bid.match_deadline)}.</strong></p>
 <p>If another company bids higher before then, you will get a new email with the higher amount to match. A later bid does not extend the deadline.</p>
 <ul>
